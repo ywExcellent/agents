@@ -163,6 +163,14 @@ type SandboxSetUpdateStrategy struct {
 	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty"`
 }
 
+// SandboxSetConditionType is a valid value for SandboxSet conditions.
+type SandboxSetConditionType string
+
+const (
+	// SandboxSetConditionScalingLimited indicates whether startup blockers exhaust the scale-up budget.
+	SandboxSetConditionScalingLimited SandboxSetConditionType = "ScalingLimited"
+)
+
 // SandboxSetStatus defines the observed state of SandboxSet.
 type SandboxSetStatus struct {
 	// observedGeneration is the most recent generation observed for this SandboxSet. It corresponds to the

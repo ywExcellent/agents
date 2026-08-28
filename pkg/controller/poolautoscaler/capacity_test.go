@@ -1274,16 +1274,15 @@ func TestApplyStabilizationWindow_Cooldown(t *testing.T) {
 			expected: 5,
 		},
 		{
-			name:            "scale down blocked by recent scale up",
+			name:            "scale down is not blocked by recent scale up",
 			specReplicas:    10,
-			desiredReplicas: 5, // scale down
+			desiredReplicas: 5,
 			scaleUpWindow:   int32Ptr(60),
 			scaleDownWindow: int32Ptr(60),
 			setupMonitor: func(m *capacityMonitor) {
-				m.lastScaleUpAt = time.Now().Add(-10 * time.Second) // recent scale up
-				// lastScaleDownAt is zero — but scale down still blocked by recent scale up
+				m.lastScaleUpAt = time.Now().Add(-10 * time.Second)
 			},
-			expected: 10, // scale down blocked: last action (scale up) was 10s ago < 60s window
+			expected: 5,
 		},
 		{
 			name:            "dead zone - no scaling",
@@ -1298,15 +1297,26 @@ func TestApplyStabilizationWindow_Cooldown(t *testing.T) {
 			expected: 10,
 		},
 		{
-			name:            "window zero means no cooldown",
+			name:            "scale up window zero is normalized to minimum cooldown",
 			specReplicas:    10,
 			desiredReplicas: 15,
 			scaleUpWindow:   int32Ptr(0),
 			scaleDownWindow: int32Ptr(0),
 			setupMonitor: func(m *capacityMonitor) {
-				m.lastScaleUpAt = time.Now().Add(-1 * time.Second) // recent, would be in cooldown if window > 0
+				m.lastScaleUpAt = time.Now().Add(-1 * time.Second)
 			},
-			expected: 15,
+			expected: 10,
+		},
+		{
+			name:            "omitted scale up window uses default cooldown",
+			specReplicas:    10,
+			desiredReplicas: 15,
+			scaleUpWindow:   nil,
+			scaleDownWindow: int32Ptr(60),
+			setupMonitor: func(m *capacityMonitor) {
+				m.lastScaleUpAt = time.Now().Add(-30 * time.Second)
+			},
+			expected: 10,
 		},
 	}
 
@@ -1389,7 +1399,7 @@ func TestRecordScaleAction(t *testing.T) {
 
 // TestApplyStabilizationWindow_DefaultWindow tests the fallback logic when
 // ScaleUp/ScaleDown or their StabilizationWindowSeconds are nil.
-// - nil ScaleUp -> defaultScaleUpStabilization = 0 (no cooldown, immediate)
+// - nil ScaleUp -> default 65s cooldown
 // - nil ScaleDown -> defaultScaleDownStabilization = 300 (300s cooldown)
 func TestApplyStabilizationWindow_DefaultWindow(t *testing.T) {
 	tests := []struct {
@@ -1400,13 +1410,13 @@ func TestApplyStabilizationWindow_DefaultWindow(t *testing.T) {
 		expected        int32
 	}{
 		{
-			name:            "nil ScaleUp and ScaleDown - scale up uses default 0 (immediate)",
+			name:            "nil ScaleUp and ScaleDown - scale up uses default 65s cooldown",
 			specReplicas:    10,
 			desiredReplicas: 15,
 			setupMonitor: func(m *capacityMonitor) {
-				m.lastScaleUpAt = time.Now().Add(-1 * time.Second) // recent, but default is 0 = no cooldown
+				m.lastScaleUpAt = time.Now().Add(-1 * time.Second)
 			},
-			expected: 15,
+			expected: 10,
 		},
 		{
 			name:            "nil ScaleUp and ScaleDown - scale down uses default 300s cooldown, within cooldown",

@@ -860,7 +860,7 @@ func TestCompareScaleDownPriority(t *testing.T) {
 		}
 		return &v1alpha1.Sandbox{
 			Status: v1alpha1.SandboxStatus{
-				Phase:        phase,
+				Phase:         phase,
 				RecycledCount: recycledCount,
 				Conditions: []metav1.Condition{
 					{Type: string(v1alpha1.SandboxConditionReady), Status: readyStatus},
@@ -1074,31 +1074,31 @@ func TestCalculateScaleDelta(t *testing.T) {
 			description:       "should return actual delta when it's less than MaxUnavailable",
 		},
 		{
-			name:              "scale up 10, MaxUnavailable=50%",
+			name:              "scale up 10, MaxUnavailable=50% of observed pool",
 			replicas:          10,
 			statusReplicas:    0,
 			availableReplicas: 0,
 			maxUnavailable:    intOrStringPtr(intstrutil.FromString("50%")),
-			expectedDelta:     5,
-			description:       "should calculate percentage-based MaxUnavailable (50% of 10 = 5)",
+			expectedDelta:     1,
+			description:       "should round 50% of the minimum execution base up to one",
 		},
 		{
-			name:              "scale up 20, MaxUnavailable=30%",
+			name:              "scale up 20, MaxUnavailable=30% of observed pool",
 			replicas:          20,
 			statusReplicas:    0,
 			availableReplicas: 0,
 			maxUnavailable:    intOrStringPtr(intstrutil.FromString("30%")),
-			expectedDelta:     6,
-			description:       "should calculate percentage-based MaxUnavailable (30% of 20 = 6)",
+			expectedDelta:     1,
+			description:       "should round 30% of the minimum execution base up to one",
 		},
 		{
-			name:              "scale up 6 (from 4 to 10), MaxUnavailable=20%",
+			name:              "scale up from 4 to 10, MaxUnavailable=20% of observed pool",
 			replicas:          10,
 			statusReplicas:    4,
 			availableReplicas: 4,
 			maxUnavailable:    intOrStringPtr(intstrutil.FromString("20%")),
-			expectedDelta:     2,
-			description:       "should limit to 20% of target replicas (20% of 10 = 2)",
+			expectedDelta:     1,
+			description:       "should resolve 20% against four observed replicas",
 		},
 		{
 			name:              "MaxUnavailable=0, should block scale up",
@@ -1146,22 +1146,22 @@ func TestCalculateScaleDelta(t *testing.T) {
 			description:       "should return negative delta for scale down",
 		},
 		{
-			name:              "large scale up with MaxUnavailable=100%",
+			name:              "large scale up with MaxUnavailable=100% uses observed pool",
 			replicas:          100,
 			statusReplicas:    0,
 			availableReplicas: 0,
 			maxUnavailable:    intOrStringPtr(intstrutil.FromString("100%")),
-			expectedDelta:     100,
-			description:       "100% MaxUnavailable should allow full scale up",
+			expectedDelta:     1,
+			description:       "100% MaxUnavailable resolves against an execution base of one for an empty pool",
 		},
 		{
-			name:              "small percentage MaxUnavailable (10% of 100 = 10)",
+			name:              "percentage MaxUnavailable uses observed pool",
 			replicas:          100,
 			statusReplicas:    0,
 			availableReplicas: 0,
 			maxUnavailable:    intOrStringPtr(intstrutil.FromString("10%")),
-			expectedDelta:     10,
-			description:       "should calculate 10% of 100 replicas correctly",
+			expectedDelta:     1,
+			description:       "10% MaxUnavailable rounds up against an execution base of one",
 		},
 		{
 			name:              "edge case: MaxUnavailable=1, scale up from 99 to 100",
@@ -1191,13 +1191,13 @@ func TestCalculateScaleDelta(t *testing.T) {
 			description:       "should set to 0 when MaxUnavailable - creating < 0 (3-5=-2, set to 0)",
 		},
 		{
-			name:              "scale up with many creating sandboxes",
+			name:              "percentage MaxUnavailable subtracts creating from observed budget",
 			replicas:          10,
 			statusReplicas:    4,
 			availableReplicas: 2,
 			maxUnavailable:    intOrStringPtr(intstrutil.FromString("50%")),
-			expectedDelta:     3,
-			description:       "50% of 10 = 5, minus 2 creating = 3",
+			expectedDelta:     0,
+			description:       "50% of 4 is 2 and both slots are already creating",
 		},
 		{
 			name:              "zero delta when creating sandboxes >= MaxUnavailable",
@@ -1224,7 +1224,8 @@ func TestCalculateScaleDelta(t *testing.T) {
 				AvailableReplicas: tt.availableReplicas,
 			}
 
-			delta := calculateScaleDelta(sbs, status)
+			delta, err := calculateScaleDelta(sbs, status)
+			require.NoError(t, err)
 
 			assert.Equal(t, tt.expectedDelta, delta, tt.description)
 

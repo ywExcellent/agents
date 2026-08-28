@@ -21,7 +21,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"math"
 	"reflect"
 	"slices"
 	"time"
@@ -32,7 +31,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
-	intstrutil "k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -61,15 +59,18 @@ var (
 	concurrentReconciles = 3
 	initialBatchSize     = 16
 	controllerKind       = agentsv1alpha1.GroupVersion.WithKind("SandboxSet")
+	poolAutoscalerKind   = agentsv1alpha1.GroupVersion.WithKind("PoolAutoscaler")
 )
 
 func Add(mgr manager.Manager) error {
 	if !utilfeature.DefaultFeatureGate.Enabled(features.SandboxSetGate) || !discovery.DiscoverGVK(controllerKind) {
 		return nil
 	}
+	poolAutoscalerAvailable := discovery.DiscoverGVK(poolAutoscalerKind)
 	err := (&Reconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		poolAutoscalerAvailable: poolAutoscalerAvailable,
 	}).SetupWithManager(mgr)
 	if err != nil {
 		return err
@@ -81,9 +82,10 @@ func Add(mgr manager.Manager) error {
 // Reconciler reconciles a Sandbox object
 type Reconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
-	Codec    runtime.Codec
+	Scheme                  *runtime.Scheme
+	Recorder                record.EventRecorder
+	Codec                   runtime.Codec
+	poolAutoscalerAvailable bool
 }
 
 const (
@@ -135,9 +137,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	var requeueAfter time.Duration
 	scaleUpSatisfied, dirtyScaleUp, scaleUpTimeoutAfter := scaleExpectationSatisfied(ctx, scaleUpExpectation, controllerKey)
 	scaleDownSatisfied, _, scaleDownTimeoutAfter := scaleExpectationSatisfied(ctx, scaleDownExpectation, controllerKey)
-	requeueAfter = min(scaleUpTimeoutAfter, scaleDownTimeoutAfter)
 
 	calculateSandboxSetStatusFromGroup(ctx, newStatus, groups, dirtyScaleUp)
+	scalingLimitedTimeoutAfter, err := r.calculateScalingLimited(ctx, sbs, newStatus, groups, time.Now())
+	if err != nil {
+		log.Error(err, "failed to calculate ScalingLimited condition")
+		return ctrl.Result{}, err
+	}
+	requeueAfter = minimumPositiveDuration(scaleUpTimeoutAfter, scaleDownTimeoutAfter, scalingLimitedTimeoutAfter)
 	// Set selector in status for scale subresource
 	if newStatus.Selector == "" {
 		selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
@@ -156,7 +163,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	var allErrors error
 	// Step 1: perform scale
 	start := time.Now()
-	delta := calculateScaleDelta(sbs, newStatus)
+	delta, err := calculateScaleDelta(sbs, newStatus)
+	if err != nil {
+		log.Error(err, "failed to calculate scale delta")
+		return ctrl.Result{}, err
+	}
 	log.Info("performing scale", "expect", sbs.Spec.Replicas, "actual", newStatus.Replicas,
 		"available", newStatus.AvailableReplicas, "delta", delta)
 	if delta > 0 {
@@ -336,33 +347,28 @@ func compareScaleDownPriority(a, b *agentsv1alpha1.Sandbox) int {
 
 // calculateScaleDelta calculates the delta for scaling, considering MaxUnavailable limit.
 // Returns positive value for scale up, negative for scale down, 0 for no scaling needed.
-func calculateScaleDelta(sbs *agentsv1alpha1.SandboxSet, newStatus *agentsv1alpha1.SandboxSetStatus) int {
+func calculateScaleDelta(sbs *agentsv1alpha1.SandboxSet, newStatus *agentsv1alpha1.SandboxSetStatus) (int, error) {
 	delta := int(sbs.Spec.Replicas - newStatus.Replicas)
 	// scale down
 	if delta <= 0 {
-		return delta
+		return delta, nil
 	}
 
-	// apply maxUnavailable limit only for scale up
-	scaleMaxUnavailable := math.MaxInt
+	// Apply maxUnavailable only to physical scale-up execution.
+	scaleMaxUnavailable, err := resolveMaxUnavailable(sbs.Spec.ScaleStrategy.MaxUnavailable, newStatus.Replicas)
+	if err != nil {
+		return 0, err
+	}
 	if sbs.Spec.ScaleStrategy.MaxUnavailable != nil {
-		scaleMaxUnavailable, _ = intstrutil.GetScaledValueFromIntOrPercent(
-			intstrutil.ValueOrDefault(sbs.Spec.ScaleStrategy.MaxUnavailable, intstrutil.FromInt32(math.MaxInt32)),
-			int(sbs.Spec.Replicas),
-			true)
-		// subtract sandboxes that are currently being creating
+		// Subtract sandboxes that are currently being created, including dirty creates.
 		scaleMaxUnavailable -= int(newStatus.Replicas - newStatus.AvailableReplicas)
 	}
-	// ignore negative values
-	if scaleMaxUnavailable < 0 {
-		scaleMaxUnavailable = 0
-	}
-	// delta cannot exceed scaleMaxUnavailable
-	if delta > scaleMaxUnavailable {
-		delta = scaleMaxUnavailable
-	}
+	// Ignore negative values.
+	scaleMaxUnavailable = max(scaleMaxUnavailable, 0)
+	// Delta cannot exceed maxUnavailable headroom.
+	delta = min(delta, scaleMaxUnavailable)
 
-	return delta
+	return delta, nil
 }
 
 func (r *Reconciler) createSandbox(ctx context.Context, sbs *agentsv1alpha1.SandboxSet, revision string) (*agentsv1alpha1.Sandbox, error) {
@@ -501,18 +507,32 @@ func (r *Reconciler) groupAllSandboxes(ctx context.Context, sbs *agentsv1alpha1.
 	return groups, nil
 }
 
+func (r *Reconciler) poolAutoscalerToSandboxSet(_ context.Context, obj client.Object) []ctrl.Request {
+	pa := obj.(*agentsv1alpha1.PoolAutoscaler)
+	if pa.Spec.ScaleTargetRef.Kind != "SandboxSet" || pa.Spec.ScaleTargetRef.Name == "" {
+		return nil
+	}
+	return []ctrl.Request{{NamespacedName: client.ObjectKey{
+		Namespace: pa.Namespace,
+		Name:      pa.Spec.ScaleTargetRef.Name,
+	}}}
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	controllerName := "sandboxset-controller"
 	r.Recorder = mgr.GetEventRecorderFor(controllerName)
 	r.Codec = serializer.NewCodecFactory(mgr.GetScheme()).LegacyCodec(agentsv1alpha1.SchemeGroupVersion)
-	return ctrl.NewControllerManagedBy(mgr).
+	builder := ctrl.NewControllerManagedBy(mgr).
 		Named(controllerName).
 		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentReconciles}).
 		Watches(&agentsv1alpha1.SandboxSet{}, &handler.EnqueueRequestForObject{}).
 		Watches(&agentsv1alpha1.Sandbox{}, &SandboxEventHandler{}).
 		Watches(&agentsv1alpha1.SandboxTemplate{},
 			handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(),
-				&agentsv1alpha1.SandboxSet{}, handler.OnlyControllerOwner())).
-		Complete(r)
+				&agentsv1alpha1.SandboxSet{}, handler.OnlyControllerOwner()))
+	if r.poolAutoscalerAvailable {
+		builder = builder.Watches(&agentsv1alpha1.PoolAutoscaler{}, handler.EnqueueRequestsFromMapFunc(r.poolAutoscalerToSandboxSet))
+	}
+	return builder.Complete(r)
 }

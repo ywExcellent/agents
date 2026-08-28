@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -292,8 +293,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 	reason := result.reason
 
-	// Cron-triggered scaling bypasses the stabilization window — cron represents
-	// an explicit user intent for a specific replica count at a specific time.
+	// Cron-triggered scaling bypasses the stabilization window because it
+	// represents explicit user intent for a specific replica count at a specific time.
 	var cooldownRemaining time.Duration
 	if result.source != sourceCron {
 		var blocked bool
@@ -305,6 +306,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			r.recorder.Eventf(pa, "Normal", "ScaleBlocked",
 				"Scaling %s/%s blocked by stabilization window (cooldown remaining: %s)",
 				pa.Namespace, pa.Spec.ScaleTargetRef.Name, cooldownRemaining.Round(time.Second))
+		}
+	}
+
+	// The initial minReplicas bootstrap establishes the first observable
+	// SandboxSet condition. Later increases require a current, explicitly open
+	// execution gate from SandboxSet.
+	bootstrap := specReplicas < pa.Spec.MinReplicas && desiredReplicas == pa.Spec.MinReplicas
+	if desiredReplicas > specReplicas && !bootstrap {
+		if allowed, gateReason := sandboxSetAllowsScaleUp(sbs); !allowed {
+			desiredReplicas = specReplicas
+			limited, limitReason = false, ""
+			reason = gateReason
 		}
 	}
 
@@ -355,6 +368,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		requeueAfter = cooldownRemaining
 	}
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+// sandboxSetAllowsScaleUp reports whether SandboxSet has observed its current
+// generation and has explicitly reported available startup budget.
+func sandboxSetAllowsScaleUp(sbs *agentsv1alpha1.SandboxSet) (bool, string) {
+	if sbs.Status.ObservedGeneration < sbs.Generation {
+		return false, "scaling blocked until SandboxSet observes its current generation"
+	}
+
+	condition := apiMeta.FindStatusCondition(sbs.Status.Conditions, string(agentsv1alpha1.SandboxSetConditionScalingLimited))
+	if condition == nil || condition.ObservedGeneration != sbs.Generation {
+		return false, "scaling blocked until SandboxSet publishes a current ScalingLimited condition"
+	}
+	if condition.Status != metav1.ConditionFalse {
+		return false, fmt.Sprintf("scaling blocked by SandboxSet ScalingLimited condition (%s)", condition.Status)
+	}
+	return true, ""
 }
 
 // findConflictingAutoscaler checks whether another PoolAutoscaler in the same
