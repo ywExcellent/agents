@@ -44,6 +44,7 @@ import (
 	"github.com/openkruise/agents/pkg/sandbox-manager/errors"
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra"
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra/sandboxcr"
+	"github.com/openkruise/agents/pkg/sandbox-manager/templatecr"
 	"github.com/openkruise/agents/pkg/sandboxroute/refresh"
 	"github.com/openkruise/agents/pkg/servers/e2b/adapters"
 	"github.com/openkruise/agents/pkg/utils/network"
@@ -543,6 +544,18 @@ func TestSandboxManagerBuilder_WithMemberlistPeers(t *testing.T) {
 	}
 }
 
+func TestSandboxManagerBuilder_WithTemplateStore(t *testing.T) {
+	store := templatecr.NewStore(nil, nil)
+	builder := NewSandboxManagerBuilder(config.SandboxManagerOptions{}).WithTemplateStore(store)
+	assert.Same(t, store, builder.instance.templateStore)
+}
+
+func TestSandboxManagerBuilder_WithTemplateNameConflictChecker(t *testing.T) {
+	checker := fixedTemplateNameConflictChecker{}
+	builder := NewSandboxManagerBuilder(config.SandboxManagerOptions{}).WithTemplateNameConflictChecker(checker)
+	assert.Equal(t, checker, builder.instance.templateNameConflictChecker)
+}
+
 func TestSandboxManagerBuilder_WithRequestAdapter(t *testing.T) {
 	adapter := adapters.NewE2BAdapter(0, "")
 	builder := NewSandboxManagerBuilder(config.SandboxManagerOptions{}).
@@ -565,6 +578,8 @@ func TestSandboxManagerBuilder_Build(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotNil(t, manager)
 		assert.NotNil(t, manager.infra)
+		assert.NotNil(t, manager.templateStore)
+		assert.NotNil(t, manager.templateNameConflictChecker)
 		assert.NotNil(t, manager.proxy)
 		assert.Nil(t, manager.peersManager, "peersManager should be nil when not configured")
 	})

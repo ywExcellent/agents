@@ -57,7 +57,10 @@ type InfraBuilder struct {
 	instance *Infra
 }
 
-var _ infra.Builder = (*InfraBuilder)(nil)
+var (
+	_ infra.Builder                            = (*InfraBuilder)(nil)
+	_ infra.LogicalTemplateNameConflictChecker = (*Infra)(nil)
+)
 
 func NewInfraBuilder(opts config.SandboxManagerOptions) *InfraBuilder {
 	return &InfraBuilder{
@@ -346,6 +349,28 @@ func (i *Infra) HasTemplate(ctx context.Context, opts infra.HasTemplateOptions) 
 func (i *Infra) HasCheckpoint(ctx context.Context, opts infra.HasCheckpointOptions) bool {
 	_, err := i.Cache.GetCheckpoint(ctx, cache.GetCheckpointOptions{Namespace: opts.Namespace, CheckpointID: opts.CheckpointID})
 	return err == nil
+}
+
+// CheckLogicalTemplateNameConflict reports backend resources that occupy a
+// logical Template name while preserving lookup failures for Manager policy.
+func (i *Infra) CheckLogicalTemplateNameConflict(ctx context.Context, opts infra.CheckLogicalTemplateNameConflictOptions) (infra.LogicalTemplateNameConflict, error) {
+	key := client.ObjectKey{Namespace: opts.Namespace, Name: opts.Name}
+	for _, candidate := range []struct {
+		conflict infra.LogicalTemplateNameConflict
+		object   client.Object
+	}{
+		{conflict: infra.LogicalTemplateNameConflictSandboxSet, object: &v1alpha1.SandboxSet{}},
+		{conflict: infra.LogicalTemplateNameConflictCheckpoint, object: &v1alpha1.Checkpoint{}},
+	} {
+		err := i.Cache.GetClient().Get(ctx, key, candidate.object)
+		if err == nil {
+			return candidate.conflict, nil
+		}
+		if !apierrors.IsNotFound(err) {
+			return infra.LogicalTemplateNameConflictNone, err
+		}
+	}
+	return infra.LogicalTemplateNameConflictNone, nil
 }
 
 func (i *Infra) SelectSandboxes(ctx context.Context, opts infra.SelectSandboxesOptions) ([]infra.Sandbox, error) {

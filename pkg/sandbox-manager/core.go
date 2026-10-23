@@ -41,12 +41,15 @@ import (
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra/sandboxcr"
 	"github.com/openkruise/agents/pkg/sandbox-manager/quota"
 	quotaspec "github.com/openkruise/agents/pkg/sandbox-manager/quota/spec"
+	"github.com/openkruise/agents/pkg/sandbox-manager/templatecr"
 	"github.com/openkruise/agents/pkg/sandboxid"
 	"github.com/openkruise/agents/pkg/utils/runtime"
 )
 
 // QuotaEnforcer is the minimal surface sandbox-manager needs for admission, delete release, and cleanup.
 // InitQuota wires the production implementation.
+var _ TemplateStore = (*templatecr.Store)(nil)
+
 type QuotaEnforcer interface {
 	Acquire(ctx context.Context, req quota.AcquireRequest) error
 	Release(ctx context.Context, req quota.ReleaseRequest) error
@@ -187,6 +190,19 @@ func (b *SandboxManagerBuilder) WithQuotaEnforcer(qe QuotaEnforcer) *SandboxMana
 	return b
 }
 
+// WithTemplateStore supplies the logical Template coordination store.
+func (b *SandboxManagerBuilder) WithTemplateStore(store TemplateStore) *SandboxManagerBuilder {
+	b.instance.templateStore = store
+	return b
+}
+
+// WithTemplateNameConflictChecker supplies the neutral backend name checker
+// used to keep logical Template identities unambiguous.
+func (b *SandboxManagerBuilder) WithTemplateNameConflictChecker(checker infra.LogicalTemplateNameConflictChecker) *SandboxManagerBuilder {
+	b.instance.templateNameConflictChecker = checker
+	return b
+}
+
 func (b *SandboxManagerBuilder) Build() (*SandboxManager, error) {
 	if err := sandboxid.ValidatePrefix(b.opts.ShortSandboxIDPrefix); err != nil {
 		return nil, errors.NewError(errors.ErrorInternal, "short sandbox id prefix: %v", err)
@@ -213,6 +229,16 @@ func (b *SandboxManagerBuilder) Build() (*SandboxManager, error) {
 		return nil, errors.NewError(errors.ErrorInternal, "failed to get infra builder: %v", err)
 	}
 	b.instance.infra = builder.Build()
+	if b.instance.templateStore == nil {
+		if cacheProvider := b.instance.infra.GetCache(); cacheProvider != nil {
+			b.instance.templateStore = templatecr.NewStore(cacheProvider.GetClient(), cacheProvider.GetAPIReader)
+		}
+	}
+	if b.instance.templateNameConflictChecker == nil {
+		if checker, ok := b.instance.infra.(infra.LogicalTemplateNameConflictChecker); ok {
+			b.instance.templateNameConflictChecker = checker
+		}
+	}
 	routeSource := b.instance.infra.GetSandboxRouteSource()
 	if routeSource == nil {
 		return nil, errors.NewError(errors.ErrorInternal, "sandbox route source is not configured")
@@ -279,6 +305,11 @@ type SandboxManager struct {
 	trafficTokenOptions      identity.TokenOptions
 	trafficTokenSingleflight *trafficTokenSingleflight
 	trafficTokenIssues       trafficTokenIssueLifecycle
+
+	// templateStore owns logical Template coordination records. Backend resource
+	// name occupancy remains behind a neutral Infra capability.
+	templateStore               TemplateStore
+	templateNameConflictChecker infra.LogicalTemplateNameConflictChecker
 }
 
 // InitQuota initializes the quota subsystem. Call after Build() so that m.infra is available.

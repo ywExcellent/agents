@@ -172,6 +172,28 @@ type HasCheckpointOptions struct {
 	CheckpointID string
 }
 
+// LogicalTemplateNameConflict identifies a backend resource that occupies a
+// logical Template name.
+type LogicalTemplateNameConflict string
+
+const (
+	LogicalTemplateNameConflictNone       LogicalTemplateNameConflict = ""
+	LogicalTemplateNameConflictSandboxSet LogicalTemplateNameConflict = "SandboxSet"
+	LogicalTemplateNameConflictCheckpoint LogicalTemplateNameConflict = "Checkpoint"
+)
+
+// CheckLogicalTemplateNameConflictOptions identifies one logical Template name.
+type CheckLogicalTemplateNameConflictOptions struct {
+	Namespace string
+	Name      string
+}
+
+// LogicalTemplateNameConflictChecker exposes backend name occupancy without
+// leaking backend objects or Kubernetes clients into Manager.
+type LogicalTemplateNameConflictChecker interface {
+	CheckLogicalTemplateNameConflict(context.Context, CheckLogicalTemplateNameConflictOptions) (LogicalTemplateNameConflict, error)
+}
+
 type GetSandboxOptions struct {
 	Namespace string
 	SandboxID string
