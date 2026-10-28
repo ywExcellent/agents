@@ -37,6 +37,7 @@ var (
 	IndexClaimedSandboxID       = "sandboxID"
 	IndexUser                   = "user"
 	IndexTemplateID             = "templateID"
+	IndexSandboxSetTemplateRef  = "sandboxsetTemplateRef"
 	IndexCheckpointID           = "checkpointID"
 	IndexVolumeName             = "volumeName"
 	IndexTrafficPolicySandboxID = "trafficPolicySandboxID"
@@ -121,6 +122,20 @@ func GetIndexFuncs() []IndexFunc {
 					return nil
 				}
 				return []string{sbs.Name}
+			},
+		},
+		{
+			Obj:       &agentsv1alpha1.SandboxSet{},
+			FieldName: IndexSandboxSetTemplateRef,
+			Extract: func(obj client.Object) []string {
+				sbs, ok := obj.(*agentsv1alpha1.SandboxSet)
+				if !ok {
+					return nil
+				}
+				if ref := sbs.Spec.TemplateRef; ref != nil && ref.Name != "" {
+					return []string{ref.Name}
+				}
+				return nil
 			},
 		},
 		{
