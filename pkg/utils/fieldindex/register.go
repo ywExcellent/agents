@@ -22,31 +22,25 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
+	"github.com/openkruise/agents/pkg/templateindex"
 	commitutil "github.com/openkruise/agents/pkg/utils/commit"
 )
 
 const (
-	IndexNameForOwnerRefUID           = "ownerRefUID"
+	IndexNameForOwnerRefUID           = templateindex.OwnerUID
 	IndexNameForCheckpointSandboxName = "checkpointSandboxName"
-	IndexNameForSandboxSetTemplateRef = "sandboxSetTemplateRef"
+	IndexNameForSandboxSetTemplateRef = templateindex.TemplateRef
 )
 
 var (
 	registerOnce sync.Once
 )
 
-var OwnerIndexFunc = func(obj client.Object) []string {
-	var owners []string
-	if controller := metav1.GetControllerOfNoCopy(obj); controller != nil {
-		owners = append(owners, string(controller.UID))
-	}
-	return owners
-}
+var OwnerIndexFunc = templateindex.ControllerOwnerUID
 
 // CheckpointSandboxNameIndexFunc indexes checkpoints by spec.sandboxName,
 // falling back to spec.podName for checkpoints created from a running Pod.
@@ -66,13 +60,7 @@ var CheckpointSandboxNameIndexFunc = func(obj client.Object) []string {
 
 // SandboxSetTemplateRefIndexFunc indexes sandboxsets by spec.templateRef.name.
 // It is registered by the sandboxset controller only when SandboxSet is enabled.
-var SandboxSetTemplateRefIndexFunc = func(obj client.Object) []string {
-	sbs, ok := obj.(*agentsv1alpha1.SandboxSet)
-	if !ok || sbs.Spec.TemplateRef == nil || sbs.Spec.TemplateRef.Name == "" {
-		return nil
-	}
-	return []string{sbs.Spec.TemplateRef.Name}
-}
+var SandboxSetTemplateRefIndexFunc = templateindex.TemplateRefName
 
 var commitUIDIndexFunc = func(obj client.Object) []string {
 	if uid, ok := obj.GetLabels()[commitutil.LabelCommitUID]; ok {

@@ -966,7 +966,21 @@ func newSandboxFromSandboxSet(ctx context.Context, opts infra.ClaimSandboxOption
 				fmt.Sprintf("sandbox template %s/%s has no pod template", sbs.Namespace, sbs.Spec.TemplateRef.Name))
 		}
 	}
-	sbx := pool.NewSandboxFromSandboxSet(sbs, refTemplate)
+	var ownerTemplate *v1alpha1.SandboxTemplate
+	if owner := metav1.GetControllerOfNoCopy(sbs); owner != nil && owner.APIVersion == v1alpha1.GroupVersion.String() && owner.Kind == "SandboxTemplate" {
+		if refTemplate != nil && refTemplate.Name == owner.Name {
+			ownerTemplate = refTemplate
+		} else {
+			ownerTemplate = &v1alpha1.SandboxTemplate{}
+			if err := cache.GetClient().Get(ctx, client.ObjectKey{Namespace: sbs.Namespace, Name: owner.Name}, ownerTemplate); err != nil {
+				return nil, "", NoAvailableError(opts.Template, "cannot resolve template controller: "+err.Error())
+			}
+		}
+	}
+	sbx, err := pool.NewSandboxFromSandboxSet(sbs, refTemplate, ownerTemplate)
+	if err != nil {
+		return nil, "", NoAvailableError(opts.Template, "cannot resolve sandbox workload: "+err.Error())
+	}
 	if mergedCount := len(autopause.MergeProbes(sbx.Spec.Probes, opts.Probes)); mergedCount > autopause.MaxSandboxProbes {
 		return nil, "", NoAvailableError(opts.Template,
 			fmt.Sprintf("new sandbox merged probes exceed the Sandbox limit of %d (%d probes)", autopause.MaxSandboxProbes, mergedCount))

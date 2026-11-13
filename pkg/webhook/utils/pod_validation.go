@@ -16,14 +16,7 @@ limitations under the License.
 
 package util
 
-import corevalidation "k8s.io/kubernetes/pkg/apis/core/validation"
+import "github.com/openkruise/agents/pkg/templatevalidation"
 
-var (
-	DefaultPodValidationOptions = corevalidation.PodValidationOptions{
-		AllowInvalidPodDeletionCost:                       true,
-		AllowIndivisibleHugePagesValues:                   true,
-		AllowInvalidLabelValueInSelector:                  true,
-		AllowInvalidTopologySpreadConstraintLabelSelector: true,
-		ResourceIsPod: false,
-	}
-)
+// DefaultPodValidationOptions preserves existing admission callers.
+var DefaultPodValidationOptions = templatevalidation.PodValidationOptions()

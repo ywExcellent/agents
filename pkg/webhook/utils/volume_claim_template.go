@@ -19,56 +19,16 @@ package util
 import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+
+	"github.com/openkruise/agents/pkg/templatevalidation"
 )
 
-func ValidateVolumeClaimTemplateMounts(template *corev1.PodTemplateSpec, claims []corev1.PersistentVolumeClaim, fldPath *field.Path) field.ErrorList {
-	errList := field.ErrorList{}
-	mountedVolumeNames := map[string]struct{}{}
-
-	if template != nil {
-		recordMounts := func(containers []corev1.Container) {
-			for i := range containers {
-				for j := range containers[i].VolumeMounts {
-					mountedVolumeNames[containers[i].VolumeMounts[j].Name] = struct{}{}
-				}
-			}
-		}
-		recordMounts(template.Spec.InitContainers)
-		recordMounts(template.Spec.Containers)
-		for i := range template.Spec.EphemeralContainers {
-			for j := range template.Spec.EphemeralContainers[i].VolumeMounts {
-				mountedVolumeNames[template.Spec.EphemeralContainers[i].VolumeMounts[j].Name] = struct{}{}
-			}
-		}
-	}
-
-	for i, claim := range claims {
-		if claim.Name == "" {
-			continue
-		}
-		if _, mounted := mountedVolumeNames[claim.Name]; !mounted {
-			errList = append(errList, field.Invalid(
-				fldPath.Child("volumeClaimTemplates").Index(i).Child("metadata").Child("name"),
-				claim.Name,
-				"must be mounted by at least one container, init container, or ephemeral container",
-			))
-		}
-	}
-	return errList
+// ValidateVolumeClaimTemplateMounts retains the admission helper surface.
+func ValidateVolumeClaimTemplateMounts(template *corev1.PodTemplateSpec, claims []corev1.PersistentVolumeClaim, path *field.Path) field.ErrorList {
+	return templatevalidation.ValidateVolumeClaimTemplateMounts(template, claims, path)
 }
 
+// AppendVolumeClaimTemplateVolumes retains the admission helper surface.
 func AppendVolumeClaimTemplateVolumes(template *corev1.PodTemplateSpec, claims []corev1.PersistentVolumeClaim) {
-	if template == nil {
-		return
-	}
-	for _, claim := range claims {
-		template.Spec.Volumes = append(template.Spec.Volumes, corev1.Volume{
-			Name: claim.Name,
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: claim.Name,
-				},
-			},
-		})
-	}
+	templatevalidation.AppendVolumeClaimTemplateVolumes(template, claims)
 }

@@ -23,12 +23,11 @@ import (
 	"reflect"
 
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
-	"github.com/openkruise/agents/pkg/utils/defaults"
+	"github.com/openkruise/agents/pkg/templatevalidation"
 )
 
 type Defaulter struct {
@@ -70,28 +69,9 @@ func (h *Defaulter) Handle(ctx context.Context, req admission.Request) admission
 }
 
 func setDefaultPodTemplate(template *v1.PodTemplateSpec) {
-	if template == nil {
-		return
-	}
-	if ptr.Deref(template.Spec.AutomountServiceAccountToken, true) {
-		template.Spec.AutomountServiceAccountToken = ptr.To(false)
-	}
-	defaults.SetDefaultPodSpec(&template.Spec)
+	templatevalidation.DefaultPodTemplate(template)
 }
 
-// setDefaultVolumeClaimTemplates applies default values to the volume claim templates
 func setDefaultVolumeClaimTemplates(templates []v1.PersistentVolumeClaim) {
-	for i := range templates {
-		vct := &templates[i]
-		// Set default access modes if not specified
-		if len(vct.Spec.AccessModes) == 0 {
-			vct.Spec.AccessModes = []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce}
-		}
-
-		// Set default volume mode if not specified
-		if vct.Spec.VolumeMode == nil {
-			volumeMode := v1.PersistentVolumeFilesystem
-			vct.Spec.VolumeMode = &volumeMode
-		}
-	}
+	templatevalidation.DefaultVolumeClaimTemplates(templates)
 }
