@@ -21,7 +21,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"k8s.io/apimachinery/pkg/types"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -30,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -227,10 +227,10 @@ func (r *Reconciler) ReconcileVersion(ctx context.Context, req ctrl.Request) (ct
 	if v.Status.Phase != api.SandboxTemplatePhaseReady {
 		return ctrl.Result{}, nil
 	}
-	if err := r.ensurePool(ctx, v); err != nil {
+	if err := r.ensureCompanions(ctx, v); err != nil {
 		log.FromContext(ctx).Error(err, "reconcile template companion", "template", req.NamespacedName)
 		if r.Recorder != nil {
-			r.Recorder.Eventf(v, nil, corev1.EventTypeWarning, "CompanionReconcileFailed", "Reconcile", "Companion pool reconciliation failed; inspect controller logs.")
+			r.Recorder.Eventf(v, nil, corev1.EventTypeWarning, "CompanionReconcileFailed", "Reconcile", "Companion reconciliation failed; inspect controller logs.")
 		}
 		return ctrl.Result{RequeueAfter: retryInterval}, err
 	}
@@ -275,6 +275,51 @@ func (r *Reconciler) ensurePool(ctx context.Context, v *api.SandboxTemplate) err
 		before := p.DeepCopy()
 		p.Spec.Replicas = ptr.Deref(warm.Size, 0)
 		return r.Patch(ctx, p, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+	}
+	return nil
+}
+
+// ensureCompanions keeps the pool before its autoscaler. In automatic mode the
+// template controller owns only the pool's initial replicas, never its live size.
+func (r *Reconciler) ensureCompanions(ctx context.Context, v *api.SandboxTemplate) error {
+	if err := r.ensurePool(ctx, v); err != nil {
+		return err
+	}
+	if v.Spec.BuildOptions == nil || v.Spec.BuildOptions.WarmPool == nil {
+		return nil
+	}
+	warm := v.Spec.BuildOptions.WarmPool
+	if !ptr.Deref(warm.Enabled, true) || warm.Autoscaler == nil {
+		return nil
+	}
+	opts := warm.Autoscaler.DeepCopy()
+	expected := api.PoolAutoscalerSpec{
+		ScaleTargetRef: api.CrossVersionObjectReference{APIVersion: api.GroupVersion.String(), Kind: "SandboxSet", Name: v.Name},
+		MinReplicas:    opts.MinReplicas, MaxReplicas: opts.MaxReplicas,
+		CapacityPolicy: opts.CapacityPolicy, CronPolicies: opts.CronPolicies,
+	}
+	pa := &api.PoolAutoscaler{}
+	err := r.Get(ctx, client.ObjectKey{Namespace: v.Namespace, Name: v.Name}, pa)
+	if apierrors.IsNotFound(err) {
+		pa = &api.PoolAutoscaler{ObjectMeta: metav1.ObjectMeta{Namespace: v.Namespace, Name: v.Name}, Spec: expected}
+		if err := controllerutil.SetControllerReference(v, pa, r.Scheme); err != nil {
+			return err
+		}
+		return r.Create(ctx, pa)
+	}
+	if err != nil {
+		return err
+	}
+	if !ownedByVersion(pa, v) {
+		return fmt.Errorf("autoscaler name is occupied by a different owner")
+	}
+	if pa.DeletionTimestamp != nil {
+		return fmt.Errorf("companion autoscaler is being deleted")
+	}
+	if !equality.Semantic.DeepEqual(pa.Spec, expected) {
+		before := pa.DeepCopy()
+		pa.Spec = expected
+		return r.Patch(ctx, pa, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 	}
 	return nil
 }

@@ -18,6 +18,7 @@ package poolautoscaler
 
 import (
 	"context"
+	stderrors "errors"
 	"flag"
 	"fmt"
 	"reflect"
@@ -147,11 +148,14 @@ func (r *Reconciler) SetupWithManager(mgr manager.Manager) error {
 		}); err != nil {
 		return err
 	}
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&agentsv1alpha1.PoolAutoscaler{}).
-		Watches(&agentsv1alpha1.SandboxSet{}, handler.EnqueueRequestsFromMapFunc(r.sandboxSetToPoolAutoscaler)).
-		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentReconciles}).
-		Complete(r)
+		Watches(&agentsv1alpha1.SandboxSet{}, handler.EnqueueRequestsFromMapFunc(r.sandboxSetToPoolAutoscaler))
+	if discovery.DiscoverGVK(agentsv1alpha1.SandboxTemplateClaimControllerKind) {
+		b = b.Watches(&agentsv1alpha1.SandboxTemplate{}, handler.EnqueueRequestsFromMapFunc(r.templateToPoolAutoscaler)).
+			Watches(&agentsv1alpha1.SandboxTemplateClaim{}, handler.EnqueueRequestsFromMapFunc(r.claimToPoolAutoscaler))
+	}
+	return b.WithOptions(controller.Options{MaxConcurrentReconciles: concurrentReconciles}).Complete(r)
 }
 
 // sandboxSetToPoolAutoscaler maps a SandboxSet change to the PoolAutoscaler that targets it.
@@ -188,6 +192,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
+	}
+
+	// Deletion does not drain an already submitted write, but no newly observed
+	// deleting autoscaler starts another scaling decision.
+	if pa.DeletionTimestamp != nil {
+		r.deleteMonitor(req.NamespacedName)
+		r.scaleBlockedReported.Delete(req.NamespacedName.String())
+		return ctrl.Result{}, nil
 	}
 
 	// Base copy for best-effort status patches on error paths.
@@ -234,6 +246,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
+	managed, guardErr := r.checkManagedTarget(ctx, pa, sbs)
+	if guardErr != nil {
+		r.deleteMonitor(req.NamespacedName)
+		r.scaleBlockedReported.Delete(req.NamespacedName.String())
+		if !stderrors.Is(guardErr, errInactiveManagedTarget) {
+			return ctrl.Result{}, guardErr
+		}
+		setCondition(pa, metav1.Condition{
+			Type: string(agentsv1alpha1.PoolAutoscalerConditionScalingActive), Status: metav1.ConditionFalse,
+			LastTransitionTime: metav1.Now(), ObservedGeneration: pa.Generation,
+			Reason: "InactiveManagedTarget", Message: guardErr.Error(),
+		})
+		r.persistConditions(ctx, pa, paOriginal)
+		return ctrl.Result{RequeueAfter: conflictRequeueInterval}, nil
+	}
+	var targetUID types.UID
+	if managed {
+		targetUID = sbs.UID
+	}
+
 	// Conflict detection: only the oldest PoolAutoscaler targeting a SandboxSet
 	// may scale it. This complements the webhook, which cannot fully prevent
 	// races or objects created while the webhook was unavailable.
@@ -271,11 +303,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	statusReplicas := sbs.Status.Replicas
 	statusAvailable := sbs.Status.AvailableReplicas
 
-	avgAvailable, avgReplicas, _ := r.observeAndAggregate(ctx, pa, statusAvailable, statusReplicas)
+	avgAvailable, avgReplicas, _ := r.observeAndAggregate(ctx, pa, statusAvailable, statusReplicas, targetUID)
 
 	// Retrieve the monitor early — needed for the warm-up check and requeue logic.
 	key := types.NamespacedName{Namespace: pa.Namespace, Name: pa.Name}
-	monitor := r.getOrCreateMonitorFor(key, pa.UID, pa.Spec.ScaleTargetRef.Name)
+	monitor := r.getOrCreateMonitorFor(key, pa.UID, pa.Spec.ScaleTargetRef.Name, targetUID)
 
 	result, err := r.computeDesiredReplicas(ctx, pa, specReplicas, avgReplicas, avgAvailable)
 	if err != nil {
@@ -319,7 +351,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	var cooldownRemaining time.Duration
 	if result.source != sourceCron {
 		var blocked bool
-		desiredReplicas, blocked, cooldownRemaining = r.applyStabilizationWindow(pa, specReplicas, desiredReplicas)
+		desiredReplicas, blocked, cooldownRemaining = r.applyStabilizationWindow(pa, specReplicas, desiredReplicas, targetUID)
 		if blocked {
 			// The bound-limited value was discarded in favor of the current spec.
 			limited, limitReason = false, ""
@@ -347,7 +379,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// Compare against spec (what we previously told SandboxSet), not status
 	if desiredReplicas != specReplicas {
-		if err := r.doScale(ctx, sbs, desiredReplicas); err != nil {
+		if err := r.scaleTarget(ctx, pa, sbs, desiredReplicas, managed); err != nil {
 			setCondition(pa, metav1.Condition{
 				Type:               string(agentsv1alpha1.PoolAutoscalerConditionAbleToScale),
 				Status:             metav1.ConditionFalse,
