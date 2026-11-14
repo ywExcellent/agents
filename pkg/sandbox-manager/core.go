@@ -78,6 +78,7 @@ type SandboxManagerBuilder struct {
 	// the sandbox infra so claim/clone post-processing can resolve the
 	// per-sandbox runtime transport. Nil disables runtime TLS.
 	runtimeTLSBundle *runtime.TLSBundle
+	customTemplates  bool
 }
 
 func NewSandboxManagerBuilder(opts config.SandboxManagerOptions) *SandboxManagerBuilder {
@@ -99,6 +100,11 @@ func NewSandboxManagerBuilder(opts config.SandboxManagerOptions) *SandboxManager
 	}
 }
 
+func (b *SandboxManagerBuilder) WithCustomTemplates(enabled bool) *SandboxManagerBuilder {
+	b.customTemplates = enabled
+	return b
+}
+
 func (b *SandboxManagerBuilder) WithSandboxInfra() *SandboxManagerBuilder {
 	b.buildInfraFunc = func() (infra.Builder, error) {
 		mgr, health, err := infracache.NewControllerManagerWithHealth(b.opts.RestConfig, infracache.CacheScope{
@@ -113,7 +119,15 @@ func (b *SandboxManagerBuilder) WithSandboxInfra() *SandboxManagerBuilder {
 		if err != nil {
 			return nil, err
 		}
+		var templates infra.TemplateStore
+		if b.customTemplates {
+			templates, err = sandboxcr.NewTemplateStore(b.opts.RestConfig, b.opts.SandboxNamespace)
+			if err != nil {
+				return nil, err
+			}
+		}
 		return sandboxcr.NewInfraBuilder(b.opts).
+			WithTemplateStore(templates).
 			WithCache(cache).
 			WithRouteReader(b.instance.proxy).
 			WithAPIReader(mgr.GetAPIReader()).

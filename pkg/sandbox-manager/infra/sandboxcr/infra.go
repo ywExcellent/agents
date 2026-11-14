@@ -73,6 +73,11 @@ func (b *InfraBuilder) WithCache(cache cache.Provider) *InfraBuilder {
 	return b
 }
 
+func (b *InfraBuilder) WithTemplateStore(store infra.TemplateStore) *InfraBuilder {
+	b.instance.templates = store
+	return b
+}
+
 func (b *InfraBuilder) WithAPIReader(reader client.Reader) *InfraBuilder {
 	b.instance.APIReader = reader
 	return b
@@ -96,6 +101,7 @@ func (b *InfraBuilder) Build() infra.Infrastructure {
 }
 
 type Infra struct {
+	templates infra.TemplateStore
 	Cache     cache.Provider
 	APIReader client.Reader
 	Routes    infra.RouteReader
@@ -112,10 +118,24 @@ type Infra struct {
 }
 
 func (i *Infra) Run(ctx context.Context) error {
-	return i.Cache.Run(ctx)
+	if err := i.Cache.Run(ctx); err != nil {
+		return err
+	}
+	if i.templates != nil {
+		if err := i.templates.Run(ctx); err != nil {
+			i.Cache.Stop(ctx)
+			return err
+		}
+	}
+	return nil
 }
 
+func (i *Infra) GetTemplateStore() infra.TemplateStore { return i.templates }
+
 func (i *Infra) Stop(ctx context.Context) {
+	if i.templates != nil {
+		i.templates.Stop(ctx)
+	}
 	i.Cache.Stop(ctx)
 }
 

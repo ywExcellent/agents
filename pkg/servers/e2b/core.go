@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -35,8 +36,11 @@ import (
 	sandboxmanager "github.com/openkruise/agents/pkg/sandbox-manager"
 	"github.com/openkruise/agents/pkg/sandbox-manager/config"
 	"github.com/openkruise/agents/pkg/sandbox-manager/consts"
+	"github.com/openkruise/agents/pkg/sandboxroute/refresh"
 	"github.com/openkruise/agents/pkg/servers/e2b/adapters"
 	"github.com/openkruise/agents/pkg/servers/e2b/keys"
+	"github.com/openkruise/agents/pkg/servers/e2b/models"
+	templAPI "github.com/openkruise/agents/pkg/servers/template"
 	"github.com/openkruise/agents/pkg/utils/logs"
 	"github.com/openkruise/agents/pkg/utils/network"
 	utilruntime "github.com/openkruise/agents/pkg/utils/runtime"
@@ -44,6 +48,8 @@ import (
 
 // Controller handles sandbox-related operations
 type Controller struct {
+	templatePort   int
+	templateServer *templAPI.Server
 	// E2B API surface
 	maxTimeout int
 	domain     string
@@ -77,6 +83,8 @@ type Controller struct {
 // instead of a long positional parameter list keeps every value named at the
 // call site, so adding a knob cannot silently shift an argument.
 type ControllerOptions struct {
+	// CustomTemplatePort is an independent listener; zero disables it.
+	CustomTemplatePort int
 	// Domain is the static E2B domain. When empty the domain is resolved per
 	// request from the HTTP Host header.
 	Domain string
@@ -108,6 +116,7 @@ type ControllerOptions struct {
 // NewController creates a new E2B Controller from opts.
 func NewController(opts ControllerOptions) *Controller {
 	sc := &Controller{
+		templatePort:     opts.CustomTemplatePort,
 		mux:              http.NewServeMux(),
 		domain:           opts.Domain,
 		adapter:          adapters.DefaultAdapterFactory(opts.Port, opts.Manager.BindAddress),
@@ -141,6 +150,27 @@ func NewController(opts ControllerOptions) *Controller {
 }
 
 func (sc *Controller) Init(ctx context.Context) error {
+	if sc.templatePort < 0 || sc.templatePort > 65535 {
+		return errors.New("invalid custom template port")
+	}
+	if sc.templatePort > 0 {
+		if sc.keyCfg == nil {
+			return errors.New("custom template API requires team authentication")
+		}
+		memberlistPort := sc.mgrOpts.MemberlistBindPort
+		if memberlistPort <= 0 {
+			memberlistPort = config.DefaultMemberlistBindPort
+		}
+		ports := []int{portOfAddress(sc.server.Addr), memberlistPort, refresh.DefaultPort, consts.ExtProcPort}
+		if sc.metricsServer != nil {
+			ports = append(ports, portOfAddress(sc.metricsServer.Addr))
+		}
+		for _, port := range ports {
+			if sc.templatePort == port {
+				return errors.New("custom template listener conflicts with an existing listener")
+			}
+		}
+	}
 	if sc.configSource == nil {
 		return errors.New("ConfigSource is required")
 	}
@@ -149,6 +179,7 @@ func (sc *Controller) Init(ctx context.Context) error {
 
 	sandboxManager, err := sandboxmanager.NewSandboxManagerBuilder(sc.mgrOpts).
 		WithSandboxInfra().
+		WithCustomTemplates(sc.templatePort > 0).
 		WithMemberlistPeers().
 		WithPeerSecurity(sc.peerSecurity).
 		WithRequestAdapter(sc.adapter).
@@ -179,6 +210,9 @@ func (sc *Controller) Init(ctx context.Context) error {
 		if err := sc.manager.ConfigureQuota(ctx, config.QuotaOptions{}, nil); err != nil {
 			return err
 		}
+	}
+	if sc.templatePort > 0 {
+		sc.templateServer = templAPI.NewServer(network.ListenAddress(sc.mgrOpts.BindAddress, sc.templatePort), sc.manager, sc.authorizeTemplate)
 	}
 	return sc.initializeConfiguration(ctx)
 }
@@ -294,7 +328,20 @@ func (sc *Controller) startComponents(ctx context.Context) error {
 	if err := sc.manager.Run(ctx); err != nil {
 		return fmt.Errorf("sandbox manager failed to start: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if sc.templateServer != nil {
+		if err := sc.templateServer.Start(); err != nil {
+			return fmt.Errorf("start custom template API: %w", err)
+		}
+	}
 	if err := sc.startHTTPServer(); err != nil {
+		if sc.templateServer != nil {
+			if closeErr := sc.templateServer.Close(); closeErr != nil {
+				klog.FromContext(ctx).Error(closeErr, "rollback custom template listener")
+			}
+		}
 		return err
 	}
 	if sc.metricsServer != nil {
@@ -392,7 +439,15 @@ func (sc *Controller) shutdown(ctx context.Context, cancel context.CancelFunc) {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		if sc.templateServer != nil {
+			if err := sc.templateServer.Shutdown(ctx); err != nil {
+				log.Error(err, "custom template API shutdown failed")
+			}
+		}
+	}()
 	go func() {
 		defer wg.Done()
 		shutdownHTTPServer(ctx, sc.server, "HTTP server forced to shutdown")
@@ -412,4 +467,32 @@ func (sc *Controller) shutdown(ctx context.Context, cancel context.CancelFunc) {
 		sc.keys.Stop()
 	}
 	klog.InfoS("Server exited")
+}
+
+// portOfAddress is used only for listener collision validation.
+func portOfAddress(address string) int {
+	_, raw, err := net.SplitHostPort(address)
+	if err != nil {
+		return 0
+	}
+	port, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0
+	}
+	return port
+}
+
+func (sc *Controller) authorizeTemplate(ctx context.Context, raw string) (string, error) {
+	if sc.keys == nil {
+		return "", templAPI.ErrUnauthenticated
+	}
+	user, ok := sc.keys.LoadByKey(ctx, keys.ToStoredRawAPIKey(raw))
+	if !ok || user == nil {
+		return "", templAPI.ErrUnauthenticated
+	}
+	team := keys.TeamForKey(user)
+	if team == nil || team.Name == "" || team.Name == models.AdminTeamName {
+		return "", templAPI.ErrForbidden
+	}
+	return team.Name, nil
 }

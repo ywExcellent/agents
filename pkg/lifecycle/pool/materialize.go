@@ -25,9 +25,11 @@ import (
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
 	"github.com/openkruise/agents/pkg/templateconfig"
+	"github.com/openkruise/agents/pkg/templateindex"
 	"github.com/openkruise/agents/pkg/utils"
 )
 
@@ -86,6 +88,13 @@ func NewSandboxFromSandboxSet(sbs *agentsv1alpha1.SandboxSet, refTemplate, owner
 		sbx.Spec.Template.Labels[agentsv1alpha1.LabelSandboxPool] = sbx.Labels[agentsv1alpha1.LabelSandboxPool]
 	}
 
+	// A blocking, non-controller version owner makes foreground template cleanup
+	// wait for undelivered inventory even after pool loss. Native claim delivery
+	// removes all owners, so already-delivered Sandboxes stay independent.
+	owner := metav1.GetControllerOfNoCopy(sbs)
+	if owner != nil && owner.APIVersion == agentsv1alpha1.GroupVersion.String() && owner.Kind == "SandboxTemplate" && refTemplate != nil && owner.UID == refTemplate.UID && templateindex.ClaimOwnerReference(refTemplate) != nil {
+		sbx.OwnerReferences = append(sbx.OwnerReferences, metav1.OwnerReference{APIVersion: agentsv1alpha1.GroupVersion.String(), Kind: "SandboxTemplate", Name: refTemplate.Name, UID: refTemplate.UID, Controller: ptr.To(false), BlockOwnerDeletion: ptr.To(true)})
+	}
 	return sbx, nil
 }
 
