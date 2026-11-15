@@ -1,0 +1,123 @@
+# Optional TLS fixture. The frontend Service stays ClusterIP intentionally.
+# Port-forward it to local :8081, or explicitly map external host:8081 to it.
+# A normal 443 Ingress, or an unrelated LoadBalancer IP, is NOT that mapping.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: template-api-tls-config
+  namespace: sandbox-system
+data:
+  envoy.yaml: |
+    static_resources:
+      listeners:
+        - name: custom_template_tls
+          address:
+            socket_address:
+              address: 0.0.0.0
+              port_value: 8443
+          filter_chains:
+            - transport_socket:
+                name: envoy.transport_sockets.tls
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+                  common_tls_context:
+                    alpn_protocols: ["h2", "http/1.1"]
+                    tls_params:
+                      tls_minimum_protocol_version: TLSv1_2
+                    tls_certificates:
+                      - certificate_chain:
+                          filename: /certs/tls.crt
+                        private_key:
+                          filename: /certs/tls.key
+              filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: custom_template_tls
+                    codec_type: AUTO
+                    route_config:
+                      name: custom_template_root
+                      virtual_hosts:
+                        - name: custom_template
+                          domains: ["*"]
+                          routes:
+                            - match:
+                                prefix: /templates
+                              route:
+                                cluster: custom_template_backend
+                                timeout: 35s
+                    http_filters:
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      clusters:
+        - name: custom_template_backend
+          type: STRICT_DNS
+          connect_timeout: 5s
+          load_assignment:
+            cluster_name: custom_template_backend
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: sandbox-manager
+                          port_value: 8081
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: template-api-tls
+  namespace: sandbox-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      component: template-api-tls
+  template:
+    metadata:
+      labels:
+        component: template-api-tls
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: envoy
+          # Same Envoy image as the existing repository E2E proxy.
+          image: envoyproxy/envoy:v1.33-latest
+          imagePullPolicy: IfNotPresent
+          args: ["-c", "/etc/envoy/envoy.yaml"]
+          ports:
+            - name: https-templates
+              containerPort: 8443
+          readinessProbe:
+            tcpSocket:
+              port: https-templates
+          volumeMounts:
+            - name: config
+              mountPath: /etc/envoy
+              readOnly: true
+            - name: certificates
+              mountPath: /certs
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: template-api-tls-config
+        - name: certificates
+          secret:
+            secretName: sandbox-manager-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: template-api-tls
+  namespace: sandbox-system
+spec:
+  type: ClusterIP
+  selector:
+    component: template-api-tls
+  ports:
+    - name: templates-tls
+      port: 8081
+      targetPort: https-templates
+      protocol: TCP

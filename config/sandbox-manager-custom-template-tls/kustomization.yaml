@@ -1,0 +1,6 @@
+# Optional repository E2E orchestration, not production network configuration.
+# Base continues serving the unchanged legacy protocol and raw custom 8081.
+# Requires an existing sandbox-manager-tls Secret (tls.crt/tls.key).
+resources:
+  - ../sandbox-manager
+  - tls-proxy.yaml

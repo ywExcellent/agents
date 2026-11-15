@@ -62,6 +62,7 @@ type Reconciler struct {
 
 const retryInterval = 2 * time.Second
 
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch;update
 // +kubebuilder:rbac:groups=agents.kruise.io,resources=sandboxtemplateclaims;sandboxtemplates;sandboxsets;poolautoscalers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=agents.kruise.io,resources=sandboxtemplateclaims/finalizers;sandboxtemplates/finalizers,verbs=update
 // +kubebuilder:rbac:groups=agents.kruise.io,resources=sandboxtemplates/status,verbs=get;update;patch

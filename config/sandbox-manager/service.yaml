@@ -14,6 +14,12 @@ spec:
       targetPort: 8080
       protocol: TCP
       name: manager
+    # Custom management protocol: root /templates, never /kruise/api.
+    # ClusterIP exposure does not imply an externally reachable TLS endpoint.
+    - port: 8081
+      targetPort: http-templates
+      protocol: TCP
+      name: templates
   selector:
     component: sandbox-manager
     app.kubernetes.io/name: sandbox-manager

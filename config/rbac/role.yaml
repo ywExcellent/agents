@@ -17,14 +17,6 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - events
-  verbs:
-  - create
-  - patch
-  - update
-- apiGroups:
-  - ""
-  resources:
   - persistentvolumeclaims
   - pods
   verbs:
@@ -51,6 +43,15 @@ rules:
   verbs:
   - get
   - list
+- apiGroups:
+  - ""
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+  - update
 - apiGroups:
   - admissionregistration.k8s.io
   resources:
