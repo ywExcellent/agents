@@ -22,7 +22,6 @@ import (
 	"net/http"
 	"reflect"
 
-	v1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
@@ -53,10 +52,8 @@ func (h *Defaulter) Handle(ctx context.Context, req admission.Request) admission
 	}
 
 	clone := obj.DeepCopy()
-	setDefaultPodTemplate(obj.Spec.Template)
-
-	// Apply defaulting logic to volume claim templates
-	setDefaultVolumeClaimTemplates(obj.Spec.VolumeClaimTemplates)
+	templatevalidation.DefaultPodTemplate(obj.Spec.Template)
+	templatevalidation.DefaultVolumeClaimTemplates(obj.Spec.VolumeClaimTemplates)
 
 	if !reflect.DeepEqual(obj, clone) {
 		marshal, err := json.Marshal(obj)
@@ -66,12 +63,4 @@ func (h *Defaulter) Handle(ctx context.Context, req admission.Request) admission
 		return admission.PatchResponseFromRaw(req.Object.Raw, marshal)
 	}
 	return admission.Allowed("")
-}
-
-func setDefaultPodTemplate(template *v1.PodTemplateSpec) {
-	templatevalidation.DefaultPodTemplate(template)
-}
-
-func setDefaultVolumeClaimTemplates(templates []v1.PersistentVolumeClaim) {
-	templatevalidation.DefaultVolumeClaimTemplates(templates)
 }

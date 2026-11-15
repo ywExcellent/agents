@@ -59,9 +59,7 @@ func templateTestClient(t *testing.T, objects ...client.Object) client.WithWatch
 	}
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithStatusSubresource(&api.SandboxTemplate{}).
 		WithIndex(&api.SandboxTemplate{}, templateindex.ClaimOwner, templateindex.ClaimOwnerUID).
-		WithIndex(&api.SandboxSet{}, templateindex.TemplateRef, templateindex.TemplateRefName).
-		WithIndex(&api.SandboxSet{}, templateindex.VersionOwner, templateindex.VersionOwnerUID).
-		WithIndex(&api.PoolAutoscaler{}, templateindex.VersionOwner, templateindex.VersionOwnerUID).Build()
+		WithIndex(&api.SandboxSet{}, templateindex.TemplateRef, templateindex.TemplateRefName).Build()
 }
 func TestTemplateStoreBoundGetAndNamespace(t *testing.T) {
 	tests := []struct {

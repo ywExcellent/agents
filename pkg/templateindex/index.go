@@ -33,7 +33,6 @@ const (
 	ClaimOwner   = "templateClaimOwnerUID"
 	VersionOwner = "templateVersionOwnerUID"
 	TemplateRef  = "sandboxSetTemplateRef"
-	ScaleTarget  = "templateScaleTargetName"
 )
 
 // ClaimOwnerReference identifies a version carrying an actual Claim controller
@@ -45,6 +44,21 @@ func ClaimOwnerReference(template *api.SandboxTemplate) *metav1.OwnerReference {
 	}
 	owner := metav1.GetControllerOfNoCopy(template)
 	if owner == nil || owner.APIVersion != api.GroupVersion.String() || owner.Kind != "SandboxTemplateClaim" || owner.Name == "" || owner.UID == "" {
+		return nil
+	}
+	return owner
+}
+
+// VersionOwnerReference identifies an object whose controller reference names a
+// SandboxTemplate version. Callers still confirm namespace, name and UID against
+// the actual version in their own backend. The returned reference is shared
+// read-only metadata and must not be mutated.
+func VersionOwnerReference(obj metav1.Object) *metav1.OwnerReference {
+	if obj == nil {
+		return nil
+	}
+	owner := metav1.GetControllerOfNoCopy(obj)
+	if owner == nil || owner.APIVersion != api.GroupVersion.String() || owner.Kind != "SandboxTemplate" || owner.Name == "" || owner.UID == "" {
 		return nil
 	}
 	return owner
@@ -78,11 +92,8 @@ func ClaimOwnerUID(obj client.Object) []string {
 // VersionOwnerUID indexes managed-resource candidates. Consumers must confirm
 // the referenced version and its Claim owner before treating them as companions.
 func VersionOwnerUID(obj client.Object) []string {
-	if obj == nil {
-		return nil
-	}
-	owner := metav1.GetControllerOfNoCopy(obj)
-	if owner == nil || owner.APIVersion != api.GroupVersion.String() || owner.Kind != "SandboxTemplate" || owner.Name == "" || owner.UID == "" {
+	owner := VersionOwnerReference(obj)
+	if owner == nil {
 		return nil
 	}
 	return []string{string(owner.UID)}
@@ -98,15 +109,6 @@ func TemplateRefName(obj client.Object) []string {
 	return []string{pool.Spec.TemplateRef.Name}
 }
 
-// ScaleTargetName indexes declared target names within the query namespace.
-func ScaleTargetName(obj client.Object) []string {
-	pa, ok := obj.(*api.PoolAutoscaler)
-	if !ok || pa == nil || pa.Spec.ScaleTargetRef.Name == "" {
-		return nil
-	}
-	return []string{pa.Spec.ScaleTargetRef.Name}
-}
-
 // Register installs indexes on this specific control view. There is deliberately
 // no process-global once: every independent cache must register and report errors.
 func Register(ctx context.Context, indexer client.FieldIndexer) error {
@@ -120,14 +122,8 @@ func Register(ctx context.Context, indexer client.FieldIndexer) error {
 	}{
 		{&api.SandboxTemplate{}, ClaimOwner, ClaimOwnerUID},
 		{&api.SandboxSet{}, TemplateRef, TemplateRefName},
-		{&api.SandboxSet{}, VersionOwner, VersionOwnerUID},
-		{&api.PoolAutoscaler{}, VersionOwner, VersionOwnerUID},
-		{&api.PoolAutoscaler{}, ScaleTarget, ScaleTargetName},
 	}
 	for _, entry := range entries {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
 		if err := indexer.IndexField(ctx, entry.object, entry.name, entry.extract); err != nil {
 			return fmt.Errorf("register template index %q on %T: %w", entry.name, entry.object, err)
 		}

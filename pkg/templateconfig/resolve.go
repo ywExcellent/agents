@@ -21,8 +21,6 @@ package templateconfig
 import (
 	"fmt"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	api "github.com/openkruise/agents/api/v1alpha1"
 	"github.com/openkruise/agents/pkg/templateindex"
 )
@@ -35,15 +33,15 @@ func ResolveTemplateSpec(sbs *api.SandboxSet, reference, ownerTemplate *api.Sand
 	if sbs == nil {
 		return nil, fmt.Errorf("sandboxset is required")
 	}
-	controller := metav1.GetControllerOfNoCopy(sbs)
-	if controller != nil && controller.APIVersion == api.GroupVersion.String() && controller.Kind == "SandboxTemplate" {
+	controller := templateindex.VersionOwnerReference(sbs)
+	if controller != nil {
 		if ownerTemplate == nil && reference != nil && reference.Name == controller.Name {
 			ownerTemplate = reference
 		}
 		if ownerTemplate == nil {
 			return nil, fmt.Errorf("cannot resolve sandboxset template controller %s/%s", sbs.Namespace, controller.Name)
 		}
-		if controller.UID == "" || ownerTemplate.UID != controller.UID || ownerTemplate.Name != controller.Name || ownerTemplate.Namespace != sbs.Namespace {
+		if ownerTemplate.UID != controller.UID || ownerTemplate.Name != controller.Name || ownerTemplate.Namespace != sbs.Namespace {
 			return nil, fmt.Errorf("sandboxset template controller identity does not match the actual owner")
 		}
 		if templateindex.ClaimOwnerReference(ownerTemplate) != nil {

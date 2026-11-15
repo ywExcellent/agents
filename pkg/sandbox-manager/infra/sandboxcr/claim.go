@@ -51,6 +51,7 @@ import (
 	managererrors "github.com/openkruise/agents/pkg/sandbox-manager/errors"
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra"
 	"github.com/openkruise/agents/pkg/sandboxmetrics"
+	"github.com/openkruise/agents/pkg/templateindex"
 	"github.com/openkruise/agents/pkg/tracing"
 	"github.com/openkruise/agents/pkg/utils"
 	"github.com/openkruise/agents/pkg/utils/expectations"
@@ -967,7 +968,7 @@ func newSandboxFromSandboxSet(ctx context.Context, opts infra.ClaimSandboxOption
 		}
 	}
 	var ownerTemplate *v1alpha1.SandboxTemplate
-	if owner := metav1.GetControllerOfNoCopy(sbs); owner != nil && owner.APIVersion == v1alpha1.GroupVersion.String() && owner.Kind == "SandboxTemplate" {
+	if owner := templateindex.VersionOwnerReference(sbs); owner != nil {
 		if refTemplate != nil && refTemplate.Name == owner.Name {
 			ownerTemplate = refTemplate
 		} else {

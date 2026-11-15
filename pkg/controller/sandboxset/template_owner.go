@@ -20,17 +20,17 @@ import (
 	"context"
 	"fmt"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	api "github.com/openkruise/agents/api/v1alpha1"
+	"github.com/openkruise/agents/pkg/templateindex"
 )
 
 // resolveTemplateOwner loads only the declared controller from this reconciler's
 // informer-backed client. It never switches to APIReader on a cache miss.
 func (r *Reconciler) resolveTemplateOwner(ctx context.Context, sbs *api.SandboxSet, reference *api.SandboxTemplate) (*api.SandboxTemplate, error) {
-	owner := metav1.GetControllerOfNoCopy(sbs)
-	if owner == nil || owner.APIVersion != api.GroupVersion.String() || owner.Kind != "SandboxTemplate" {
+	owner := templateindex.VersionOwnerReference(sbs)
+	if owner == nil {
 		return nil, nil
 	}
 	if reference != nil && reference.Name == owner.Name {

@@ -243,9 +243,6 @@ func ValidateCustomSpec(spec api.SandboxTemplateSpec, path *field.Path) field.Er
 // legacy updates remain outside the new custom contract. Owner removal must not
 // provide a two-step escape from immutability, and existing objects are not adopted.
 func ValidateManagedUpdate(oldTemplate, newTemplate *api.SandboxTemplate, path *field.Path) field.ErrorList {
-	if oldTemplate == nil || newTemplate == nil {
-		return field.ErrorList{field.Required(path, "old and new template definitions are required")}
-	}
 	oldOwner := templateindex.ClaimOwnerReference(oldTemplate)
 	newOwner := templateindex.ClaimOwnerReference(newTemplate)
 	if oldOwner == nil && newOwner == nil {

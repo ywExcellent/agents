@@ -148,23 +148,18 @@ func (r *Reconciler) ReconcileClaim(ctx context.Context, req ctrl.Request) (ctrl
 		}
 	}
 	for _, candidate := range versions {
-		v := &api.SandboxTemplate{}
-		err := r.Get(ctx, client.ObjectKeyFromObject(candidate), v)
-		if apierrors.IsNotFound(err) {
-			err = r.Reader.Get(ctx, client.ObjectKeyFromObject(candidate), v)
-		}
-		if apierrors.IsNotFound(err) {
-			continue
-		}
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		owner := templateindex.ClaimOwnerReference(v)
-		if v.UID != candidate.UID || owner == nil || owner.Name != c.Name || owner.UID != c.UID {
-			continue
-		}
-		if v.DeletionTimestamp == nil {
-			if err := r.Delete(ctx, v, client.Preconditions{UID: &v.UID, ResourceVersion: &v.ResourceVersion}, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
+		if candidate.DeletionTimestamp == nil {
+			err := r.Delete(ctx, candidate, client.Preconditions{UID: &candidate.UID, ResourceVersion: &candidate.ResourceVersion}, client.PropagationPolicy(metav1.DeletePropagationBackground))
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			// A UID or RV mismatch means the snapshot is stale: a same-name
+			// replacement exists or the object changed after the cached list.
+			// Requeue instead of acting on the stale snapshot.
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{RequeueAfter: retryInterval}, nil
+			}
+			if err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -238,8 +233,8 @@ func (r *Reconciler) ReconcileVersion(ctx context.Context, req ctrl.Request) (ct
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 func ownedByVersion(o client.Object, v *api.SandboxTemplate) bool {
-	ref := metav1.GetControllerOfNoCopy(o)
-	return o.GetNamespace() == v.Namespace && ref != nil && ref.APIVersion == api.GroupVersion.String() && ref.Kind == "SandboxTemplate" && ref.Name == v.Name && ref.UID == v.UID
+	ref := templateindex.VersionOwnerReference(o)
+	return o.GetNamespace() == v.Namespace && ref != nil && ref.Name == v.Name && ref.UID == v.UID
 }
 func (r *Reconciler) ensurePool(ctx context.Context, v *api.SandboxTemplate) error {
 	if v.Spec.BuildOptions == nil || v.Spec.BuildOptions.WarmPool == nil {

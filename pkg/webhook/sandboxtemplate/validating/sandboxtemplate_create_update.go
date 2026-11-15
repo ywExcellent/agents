@@ -66,7 +66,7 @@ func (h *ValidatingHandler) Handle(_ context.Context, req admission.Request) adm
 			errList = append(errList, templatevalidation.ValidateID(obj.Name, field.NewPath("metadata", "name"))...)
 			errList = append(errList, templatevalidation.ValidateCustomSpec(obj.Spec, field.NewPath("spec"))...)
 		} else {
-			errList = append(errList, validateSandboxTemplateSpec(obj.Spec, field.NewPath("spec"))...)
+			errList = append(errList, templatevalidation.ValidateSpec(obj.Spec, field.NewPath("spec"))...)
 		}
 	}
 	if len(errList) > 0 {
@@ -79,8 +79,4 @@ func validateSandboxTemplateMetadata(metadata metav1.ObjectMeta, fldPath *field.
 	var errList field.ErrorList
 	errList = append(errList, validation.ValidateObjectMeta(&metadata, true, validation.NameIsDNSSubdomain, fldPath)...)
 	return errList
-}
-
-func validateSandboxTemplateSpec(spec agentsv1alpha1.SandboxTemplateSpec, path *field.Path) field.ErrorList {
-	return templatevalidation.ValidateSpec(spec, path)
 }

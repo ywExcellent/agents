@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -40,8 +39,8 @@ var errInactiveManagedTarget = errors.New("managed scaling target is inactive")
 // Missing/changed owners and deletion stop scaling after observation, without
 // claiming strong coordination with unseen deletes or in-flight API writes.
 func (r *Reconciler) checkManagedTarget(ctx context.Context, pa *api.PoolAutoscaler, pool *api.SandboxSet) (bool, error) {
-	owner := metav1.GetControllerOfNoCopy(pa)
-	managed := owner != nil && owner.APIVersion == api.GroupVersion.String() && owner.Kind == "SandboxTemplate"
+	owner := templateindex.VersionOwnerReference(pa)
+	managed := owner != nil
 	inactive := func(message string) (bool, error) {
 		return managed, fmt.Errorf("%w: %s", errInactiveManagedTarget, message)
 	}
@@ -50,9 +49,6 @@ func (r *Reconciler) checkManagedTarget(ctx context.Context, pa *api.PoolAutosca
 	}
 	if !managed {
 		return false, nil
-	}
-	if owner.Name == "" || owner.UID == "" || pa.UID == "" || pool.UID == "" {
-		return inactive("owner or resource UID is missing")
 	}
 	v := &api.SandboxTemplate{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: pa.Namespace, Name: owner.Name}, v); err != nil {
@@ -78,8 +74,8 @@ func (r *Reconciler) checkManagedTarget(ctx context.Context, pa *api.PoolAutosca
 	if claim.UID != claimOwner.UID || claim.DeletionTimestamp != nil {
 		return inactive("claim UID changed or claim is deleting")
 	}
-	poolOwner := metav1.GetControllerOfNoCopy(pool)
-	if pool.Namespace != v.Namespace || poolOwner == nil || poolOwner.APIVersion != api.GroupVersion.String() || poolOwner.Kind != "SandboxTemplate" || poolOwner.Name != v.Name || poolOwner.UID != v.UID {
+	poolOwner := templateindex.VersionOwnerReference(pool)
+	if pool.Namespace != v.Namespace || poolOwner == nil || poolOwner.Name != v.Name || poolOwner.UID != v.UID {
 		return inactive("pool does not share the actual version owner")
 	}
 	if pa.Name != v.Name || pool.Name != v.Name || pa.Spec.ScaleTargetRef.Name != v.Name || pa.Spec.ScaleTargetRef.Kind != "SandboxSet" || pa.Spec.ScaleTargetRef.APIVersion != api.GroupVersion.String() {
@@ -114,7 +110,7 @@ func (r *Reconciler) scaleTarget(ctx context.Context, pa *api.PoolAutoscaler, po
 	if err := r.Get(ctx, client.ObjectKeyFromObject(pool), target); err != nil {
 		return err
 	}
-	if target.UID != pool.UID || target.ResourceVersion != pool.ResourceVersion || pool.ResourceVersion == "" {
+	if target.UID != pool.UID || target.ResourceVersion != pool.ResourceVersion {
 		return fmt.Errorf("%w: pool snapshot changed", errInactiveManagedTarget)
 	}
 	if _, err := r.checkManagedTarget(ctx, current, target); err != nil {
@@ -141,8 +137,7 @@ func (r *Reconciler) templateToPoolAutoscaler(ctx context.Context, obj client.Ob
 	}
 	out := []ctrl.Request{}
 	for i := range list.Items {
-		o := metav1.GetControllerOfNoCopy(&list.Items[i])
-		if o != nil && o.Kind == "SandboxTemplate" && o.APIVersion == api.GroupVersion.String() && o.Name == obj.GetName() {
+		if o := templateindex.VersionOwnerReference(&list.Items[i]); o != nil && o.Name == obj.GetName() {
 			out = append(out, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(&list.Items[i])})
 		}
 	}
@@ -156,8 +151,8 @@ func (r *Reconciler) claimToPoolAutoscaler(ctx context.Context, obj client.Objec
 	}
 	out := []ctrl.Request{}
 	for i := range list.Items {
-		o := metav1.GetControllerOfNoCopy(&list.Items[i])
-		if o == nil || o.Kind != "SandboxTemplate" || o.APIVersion != api.GroupVersion.String() || o.Name == "" {
+		o := templateindex.VersionOwnerReference(&list.Items[i])
+		if o == nil {
 			continue
 		}
 		v := &api.SandboxTemplate{}

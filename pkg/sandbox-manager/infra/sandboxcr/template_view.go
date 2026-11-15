@@ -70,7 +70,7 @@ func NewTemplateStore(config *rest.Config, namespace string) (*templateStore, er
 	if namespace != "" {
 		opts.DefaultNamespaces = map[string]ctrlcache.Config{namespace: {}}
 	}
-	for _, o := range []client.Object{&api.SandboxTemplateClaim{}, &api.SandboxTemplate{}, &api.SandboxSet{}, &api.PoolAutoscaler{}} {
+	for _, o := range []client.Object{&api.SandboxTemplateClaim{}, &api.SandboxTemplate{}, &api.SandboxSet{}} {
 		opts.ByObject[o] = ctrlcache.ByObject{}
 	}
 	c, err := ctrlcache.New(config, opts)

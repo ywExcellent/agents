@@ -91,8 +91,8 @@ func NewSandboxFromSandboxSet(sbs *agentsv1alpha1.SandboxSet, refTemplate, owner
 	// A blocking, non-controller version owner makes foreground template cleanup
 	// wait for undelivered inventory even after pool loss. Native claim delivery
 	// removes all owners, so already-delivered Sandboxes stay independent.
-	owner := metav1.GetControllerOfNoCopy(sbs)
-	if owner != nil && owner.APIVersion == agentsv1alpha1.GroupVersion.String() && owner.Kind == "SandboxTemplate" && refTemplate != nil && owner.UID == refTemplate.UID && templateindex.ClaimOwnerReference(refTemplate) != nil {
+	owner := templateindex.VersionOwnerReference(sbs)
+	if owner != nil && refTemplate != nil && owner.UID == refTemplate.UID && templateindex.ClaimOwnerReference(refTemplate) != nil {
 		sbx.OwnerReferences = append(sbx.OwnerReferences, metav1.OwnerReference{APIVersion: agentsv1alpha1.GroupVersion.String(), Kind: "SandboxTemplate", Name: refTemplate.Name, UID: refTemplate.UID, Controller: ptr.To(false), BlockOwnerDeletion: ptr.To(true)})
 	}
 	return sbx, nil

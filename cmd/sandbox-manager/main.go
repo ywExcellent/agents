@@ -42,10 +42,10 @@ import (
 	"github.com/openkruise/agents/pkg/sandbox-manager/clients"
 	"github.com/openkruise/agents/pkg/sandbox-manager/config"
 	"github.com/openkruise/agents/pkg/sandbox-manager/consts"
-	"github.com/openkruise/agents/pkg/sandboxroute/refresh"
 	"github.com/openkruise/agents/pkg/servers/e2b"
 	"github.com/openkruise/agents/pkg/servers/e2b/keys"
 	"github.com/openkruise/agents/pkg/servers/e2b/models"
+	"github.com/openkruise/agents/pkg/servers/template"
 	"github.com/openkruise/agents/pkg/tracing"
 	"github.com/openkruise/agents/pkg/utils"
 	utilfeature "github.com/openkruise/agents/pkg/utils/feature"
@@ -75,24 +75,6 @@ func validateMetricsPort(metricsPort, controlPort, memberlistBindPort int) error
 	}
 	if metricsPort != controlPort && metricsPort == memberlistBindPort {
 		return fmt.Errorf("--metrics-port (%d) must differ from --memberlist-bind-port (%d) when using a dedicated metrics listener", metricsPort, memberlistBindPort)
-	}
-	return nil
-}
-
-func validateCustomTemplatePort(customPort, legacyPort, metricsPort, memberlistPort int) error {
-	if customPort == 0 {
-		return nil
-	}
-	if customPort < 1 || customPort > 65535 {
-		return fmt.Errorf("port must be 0 or in the range 1-65535")
-	}
-	if memberlistPort <= 0 {
-		memberlistPort = config.DefaultMemberlistBindPort
-	}
-	for _, port := range []int{legacyPort, metricsPort, memberlistPort, refresh.DefaultPort, consts.ExtProcPort} {
-		if customPort == port {
-			return fmt.Errorf("custom port %d conflicts with an existing listener", customPort)
-		}
 	}
 	return nil
 }
@@ -162,7 +144,7 @@ func main() {
 
 	// Register server configuration flags
 	pflag.IntVar(&port, "port", 8080, "The port the server listens on")
-	pflag.IntVar(&customTemplatePort, "custom-template-port", 8081, "Independent custom Template API port (0 disables it; requires team authentication)")
+	pflag.IntVar(&customTemplatePort, "custom-template-port", template.DefaultPort, "Independent custom Template API port (0 disables it; requires team authentication)")
 	pflag.IntVar(&metricsPort, "metrics-port", 0,
 		"Port for GET /metrics and GET /health; 0 or the same value as --port serves both on the control API listener")
 	pflag.StringVar(&e2bAdminKey, "e2b-admin-key", "", "E2B admin API key. Empty skips creating and rotating the canonical admin key; --e2b-enable-auth still controls authentication")
@@ -314,9 +296,6 @@ func main() {
 	// Validate timeout flags.
 	if err := validateE2BTimeoutFlags(e2bMaxTimeout); err != nil {
 		klog.Fatalf("invalid e2b timeout flags: %v", err)
-	}
-	if err := validateCustomTemplatePort(customTemplatePort, port, metricsPort, memberlistBindPort); err != nil {
-		klog.Fatalf("invalid custom-template-port: %v", err)
 	}
 	if err := validateMetricsPort(metricsPort, port, memberlistBindPort); err != nil {
 		klog.Fatalf("invalid metrics-port flag: %v", err)
