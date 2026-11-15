@@ -824,14 +824,15 @@ These are bounded Infra correctness capabilities, not API-to-Infra shortcuts. Re
 
 #### Complete Control View and Indexes
 
-An independent Template control cache covers supported team namespaces and Claims, versions, SandboxSet references, and PoolAutoscalers, without inheriting the legacy consumption SandboxLabelSelector. Do not remove legacy consumption filtering. External pools without matching business labels must still block deletion.
+The manager's independent Template control cache covers supported team namespaces and Claims, versions, and SandboxSet references, without inheriting the legacy consumption SandboxLabelSelector and without watching PoolAutoscalers. Companion PoolAutoscaler discovery and cleanup run in the template controller, whose own cache registers the version-owner index over SandboxSets and PoolAutoscalers. Do not remove legacy consumption filtering. External pools without matching business labels must still block deletion.
 
-| Index | Purpose |
-| --- | --- |
-| Version Claim-owner UID | Versions of the current Claim; recheck owner kind/UID after retrieval |
-| SandboxSet.spec.templateRef.name | Namespace + version-name reference lookup; mirror the existing typed-by-name lookup and check actual owner identity to distinguish companions |
-| Pool/autoscaler version-owner UID | Owned companion discovery/cleanup |
-| PoolAutoscaler.scaleTargetRef | Target-reference/conflict lookup; not ownership proof |
+| Index | Registered by | Purpose |
+| --- | --- | --- |
+| Version Claim-owner UID | Manager control view | Versions of the current Claim; recheck owner kind/UID after retrieval |
+| SandboxSet.spec.templateRef.name | Manager control view | Namespace + version-name reference lookup; mirror the existing typed-by-name lookup and check actual owner identity to distinguish companions |
+| Pool/autoscaler version-owner UID | Template controller cache | Owned companion discovery/cleanup |
+
+The poolautoscaler controller keeps its own pre-existing scaleTargetRef index for event wiring; it is not part of this API's control view.
 
 Existing SandboxSet materialization/revision paths resolve SandboxTemplate by `templateRef.name` and currently ignore GVK hints. Therefore external-reference checks conservatively include every matching name, even if the ref contains stale PodTemplate/v1 hints. Genuine-companion inheritance still requires the explicit SandboxTemplate GVK and actual owner UID.
 
@@ -918,6 +919,7 @@ The server uses `--custom-template-port` (default 8081; 0 disables this listener
 | Request/process/controller exit loses cleanup | Synchronous finalizers, actual owner chain, durable deletion; timeout does not cancel |
 | No strong coordination permits concurrent failures/new invalid refs | Document races; no drain/reference transaction; keep identity/retention protections |
 | Insufficient finalizer/GC completion evidence | Validate inventory completion with parent protection; cached emptiness/parent NotFound alone is insufficient |
+| Direct CR writes forge Claim ownerReferences on create | The trust model is API-key tenants without CR write permission; same-namespace CR writers already hold stronger rights. Versions whose Claim is absent or mismatched are deleted by the controller; no create-side owner existence Get, because it cannot stop same-namespace adoption anyway |
 
 Validate all input in team scope. Users cannot supply root metadata/system owners/scaling targets. Use existing structured logging/Events without new metrics, and never write sensitive keys/credentials into status.
 

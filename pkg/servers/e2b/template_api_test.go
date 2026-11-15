@@ -22,6 +22,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/openkruise/agents/pkg/servers/e2b/keys"
 	"github.com/openkruise/agents/pkg/servers/e2b/models"
 	templAPI "github.com/openkruise/agents/pkg/servers/template"
 )
@@ -56,10 +57,34 @@ func TestCustomTemplateAuthenticationUsesTeamNameAndSharedStore(t *testing.T) {
 	}
 }
 func TestCustomTemplatePortRejectsNoAuthenticationAndCollisions(t *testing.T) {
-	for _, port := range []int{-1, 65536, 8080, 9001, 9002, 7946} {
-		sc := NewController(ControllerOptions{Port: 8080, CustomTemplatePort: port})
-		if err := sc.Init(t.Context()); err == nil {
-			t.Fatalf("port=%d unexpectedly initialized", port)
-		}
+	// With a key config present the collision branch runs; without one the
+	// auth requirement fails first, which the "no authentication" case pins.
+	authed := func(port int) ControllerOptions {
+		return ControllerOptions{Port: 8080, CustomTemplatePort: port, KeyConfig: &keys.Config{Mode: keys.StorageModeSecret}}
+	}
+	const collision = "custom template listener conflicts with an existing listener"
+	tests := []struct {
+		name string
+		opts ControllerOptions
+		want string
+	}{
+		{name: "no authentication", opts: ControllerOptions{Port: 8080, CustomTemplatePort: 9001}, want: "custom template API requires team authentication"},
+		{name: "below range", opts: authed(-1), want: "invalid custom template port"},
+		{name: "above range", opts: authed(65536), want: "invalid custom template port"},
+		{name: "legacy listener", opts: authed(8080), want: collision},
+		{name: "route refresh listener", opts: authed(7789), want: collision},
+		{name: "ext proc listener", opts: authed(9002), want: collision},
+		{name: "memberlist listener", opts: authed(7946), want: collision},
+		{name: "dedicated metrics listener", opts: ControllerOptions{Port: 8080, MetricsPort: 9001, CustomTemplatePort: 9001, KeyConfig: &keys.Config{Mode: keys.StorageModeSecret}}, want: collision},
+		{name: "disabled passes the listener block", opts: authed(0), want: "ConfigSource is required"},
+		{name: "free port passes the listener block", opts: authed(9001), want: "ConfigSource is required"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := NewController(test.opts).Init(t.Context())
+			if err == nil || err.Error() != test.want {
+				t.Fatalf("error=%v want %q", err, test.want)
+			}
+		})
 	}
 }
