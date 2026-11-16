@@ -19,6 +19,7 @@ package sandboxtemplate
 import (
 	"context"
 	"fmt"
+	"maps"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -40,6 +41,7 @@ import (
 
 	api "github.com/openkruise/agents/api/v1alpha1"
 	"github.com/openkruise/agents/pkg/discovery"
+	"github.com/openkruise/agents/pkg/templateconfig"
 	"github.com/openkruise/agents/pkg/templatecreation"
 	"github.com/openkruise/agents/pkg/templateindex"
 	"github.com/openkruise/agents/pkg/templatevalidation"
@@ -214,7 +216,8 @@ func (r *Reconciler) ensurePool(ctx context.Context, v *api.SandboxTemplate, war
 	p := &api.SandboxSet{}
 	err := r.Get(ctx, client.ObjectKey{Namespace: v.Namespace, Name: v.Name}, p)
 	if apierrors.IsNotFound(err) {
-		p = &api.SandboxSet{ObjectMeta: metav1.ObjectMeta{Namespace: v.Namespace, Name: v.Name}, Spec: api.SandboxSetSpec{Replicas: ptr.Deref(warm.Size, 0)}}
+		metadata := templateconfig.UserMetadata(v.Labels, v.Annotations)
+		p = &api.SandboxSet{ObjectMeta: metav1.ObjectMeta{Namespace: v.Namespace, Name: v.Name, Labels: metadata.Labels, Annotations: metadata.Annotations}, Spec: api.SandboxSetSpec{Replicas: ptr.Deref(warm.Size, 0)}}
 		p.Spec.TemplateRef = expected
 		if err := controllerutil.SetControllerReference(v, p, r.Scheme); err != nil {
 			return err
@@ -233,9 +236,26 @@ func (r *Reconciler) ensurePool(ctx context.Context, v *api.SandboxTemplate, war
 	if p.Spec.Template != nil || !equality.Semantic.DeepEqual(p.Spec.TemplateRef, expected) {
 		return fmt.Errorf("managed pool definition reference differs from its owner")
 	}
+	before := p.DeepCopy()
+	metadata := templateconfig.UserMetadata(v.Labels, v.Annotations)
+	// Restore declared business values without deleting unrelated admission or
+	// controller keys. Immutable API definitions have no user key removals.
+	if len(metadata.Labels) > 0 {
+		if p.Labels == nil {
+			p.Labels = map[string]string{}
+		}
+		maps.Copy(p.Labels, metadata.Labels)
+	}
+	if len(metadata.Annotations) > 0 {
+		if p.Annotations == nil {
+			p.Annotations = map[string]string{}
+		}
+		maps.Copy(p.Annotations, metadata.Annotations)
+	}
 	if warm.Autoscaler == nil && p.Spec.Replicas != ptr.Deref(warm.Size, 0) {
-		before := p.DeepCopy()
 		p.Spec.Replicas = ptr.Deref(warm.Size, 0)
+	}
+	if !equality.Semantic.DeepEqual(p.Labels, before.Labels) || !equality.Semantic.DeepEqual(p.Annotations, before.Annotations) || p.Spec.Replicas != before.Spec.Replicas {
 		return r.Patch(ctx, p, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 	}
 	return nil

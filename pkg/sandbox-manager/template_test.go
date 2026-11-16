@@ -49,12 +49,12 @@ type templateBusinessStore struct {
 	definition               templateconfig.Definition
 }
 
-func (s *templateBusinessStore) CreateClaim(_ context.Context, ns, name, _ string) (infra.TemplateClaimIdentity, error) {
+func (s *templateBusinessStore) CreateClaim(_ context.Context, ns, name, _ string, metadata templateconfig.Metadata) (infra.TemplateClaimIdentity, error) {
 	s.createCalls++
 	if s.claim != nil {
 		return infra.TemplateClaimIdentity{}, infra.ErrTemplateExists
 	}
-	s.claim = &infra.TemplateClaimObservation{Identity: infra.TemplateClaimIdentity{Namespace: ns, Name: name, UID: "claim-uid"}}
+	s.claim = &infra.TemplateClaimObservation{Metadata: metadata.Clone(), Identity: infra.TemplateClaimIdentity{Namespace: ns, Name: name, UID: "claim-uid"}}
 	return s.claim.Identity, nil
 }
 func (s *templateBusinessStore) CreateVersion(_ context.Context, _ infra.TemplateClaimIdentity, id string, d templateconfig.Definition) error {
@@ -62,7 +62,7 @@ func (s *templateBusinessStore) CreateVersion(_ context.Context, _ infra.Templat
 	if s.failVersion != nil {
 		return s.failVersion
 	}
-	s.versions = []infra.TemplateVersionObservation{{ID: id, Phase: "Ready"}}
+	s.versions = []infra.TemplateVersionObservation{{ID: id, Phase: "Ready", Metadata: d.Metadata.Clone()}}
 	return nil
 }
 func (s *templateBusinessStore) GetClaim(context.Context, string, string) (*infra.TemplateClaimObservation, error) {
@@ -114,7 +114,11 @@ func TestTemplateManagerCreationAndPartialFailure(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			s := &templateBusinessStore{failVersion: test.failure}
 			m := templateBusinessManager(s)
-			result, err := m.CreateTemplate(t.Context(), "team-a", "python-agent", templateconfig.Definition{Pod: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "python:3.12"}}}})
+			metadata := templateconfig.Metadata{Labels: map[string]string{"project": "analysis"}, Annotations: map[string]string{"description": "worker"}}
+			result, err := m.CreateTemplate(t.Context(), "team-a", "python-agent", templateconfig.Definition{Metadata: metadata, Pod: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "python:3.12"}}}})
+			if s.claim != nil && s.claim.Metadata.Labels["project"] != "analysis" {
+				t.Fatal("claim metadata missing")
+			}
 			if test.failure != nil {
 				if managererrors.GetErrCode(err) != test.want || s.claim == nil {
 					t.Fatalf("error=%v claim=%v", err, s.claim)
@@ -124,13 +128,24 @@ func TestTemplateManagerCreationAndPartialFailure(t *testing.T) {
 					t.Fatalf("repeat=%v", again)
 				}
 				summary, getErr := m.GetTemplate(t.Context(), "team-a", "python-agent", "")
-				if getErr != nil || summary.Status != "Unknown" || summary.ID != "" {
+				if getErr != nil || summary.Status != "Unknown" || summary.ID != "" || summary.Metadata.Annotations["description"] != "worker" {
 					t.Fatalf("summary=%+v error=%v", summary, getErr)
 				}
 				return
 			}
-			if err != nil || result.Status != "Pending" || len(result.ID) != 20 || s.definition.WarmPool == nil || s.definition.WarmPool.Size == nil || *s.definition.WarmPool.Size != 0 {
+			if err != nil || result.Metadata.Labels["project"] != "analysis" || result.Status != "Pending" || len(result.ID) != 20 || s.definition.WarmPool == nil || s.definition.WarmPool.Size == nil || *s.definition.WarmPool.Size != 0 {
 				t.Fatalf("summary=%+v error=%v", result, err)
+			}
+			metadata.Labels["project"] = "changed"
+			result.Metadata.Annotations["description"] = "changed"
+			listed, err := m.ListTemplates(t.Context(), "team-a")
+			if err != nil || len(listed) != 1 || listed[0].Metadata.Labels["project"] != "analysis" || listed[0].Metadata.Annotations["description"] != "worker" {
+				t.Fatalf("list=%+v error=%v", listed, err)
+			}
+			listed[0].Metadata.Labels["project"] = "changed"
+			got, err := m.GetTemplate(t.Context(), "team-a", "python-agent", result.ID)
+			if err != nil || got.Metadata.Labels["project"] != "analysis" {
+				t.Fatalf("get=%+v error=%v", got, err)
 			}
 		})
 	}
@@ -163,17 +178,22 @@ func TestTemplateManagerLatestAndBoundSelection(t *testing.T) {
 }
 func TestTemplateManagerDeleteReferenceAndCancellation(t *testing.T) {
 	for _, test := range []struct {
-		name                   string
-		external, done, cancel bool
-		want                   managererrors.ErrorCode
-		begin                  bool
+		name                           string
+		absent, external, done, cancel bool
+		want                           managererrors.ErrorCode
+		begin                          bool
 	}{
 		{name: "external refuses before write", external: true, want: managererrors.ErrorConflict},
 		{name: "completed", done: true, begin: true},
 		{name: "timeout only ends wait", cancel: true, want: managererrors.ErrorUnavailable, begin: true},
+		// The Claim is released last, so its live absence is the completion evidence.
+		{name: "absent claim is already deleted", absent: true, external: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			s := &templateBusinessStore{claim: &infra.TemplateClaimObservation{Identity: infra.TemplateClaimIdentity{Namespace: "team-a", Name: "python-agent", UID: "fixed-uid"}}, external: test.external, done: test.done}
+			if test.absent {
+				s.claim = nil
+			}
 			m := templateBusinessManager(s)
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
@@ -186,6 +206,9 @@ func TestTemplateManagerDeleteReferenceAndCancellation(t *testing.T) {
 			}
 			if (s.deleteCalls > 0) != test.begin {
 				t.Fatalf("writes=%d", s.deleteCalls)
+			}
+			if test.absent && len(s.pinned) != 0 {
+				t.Fatalf("absent claim must not start cleanup waits: %v", s.pinned)
 			}
 			for _, pinned := range s.pinned {
 				if pinned.UID != "fixed-uid" {

@@ -5964,3 +5964,32 @@ func TestRunClaimPostProcesses_RuntimeTransport(t *testing.T) {
 		})
 	}
 }
+
+func TestCustomCompanionColdSandboxMetadata(t *testing.T) {
+	instance, fc := NewTestInfra(t)
+	defer instance.Stop(t.Context())
+	_, version := templateTestFixture()
+	version.Namespace = "default"
+	version.Spec.Template = &corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "python:3.12"}}}}
+	version.Labels = map[string]string{"project": "analysis"}
+	version.Annotations = map[string]string{"description": "worker"}
+	sbs := &v1alpha1.SandboxSet{ObjectMeta: metav1.ObjectMeta{Name: version.Name, Namespace: version.Namespace, Labels: map[string]string{"project": "analysis"}, OwnerReferences: []metav1.OwnerReference{{APIVersion: v1alpha1.GroupVersion.String(), Kind: "SandboxTemplate", Name: version.Name, UID: version.UID, Controller: ptr.To(true)}}}}
+	sbs.Spec.TemplateRef = &v1alpha1.SandboxTemplateRef{Name: version.Name, Kind: ptr.To("SandboxTemplate"), APIVersion: ptr.To(v1alpha1.GroupVersion.String())}
+	require.NoError(t, fc.Create(t.Context(), version))
+	require.NoError(t, fc.Create(t.Context(), sbs))
+	require.Eventually(t, func() bool {
+		_, err := instance.Cache.PickSandboxSet(t.Context(), infracache.PickSandboxSetOptions{Name: version.Name})
+		observed := &v1alpha1.SandboxTemplate{}
+		return err == nil && instance.Cache.GetClient().Get(t.Context(), client.ObjectKeyFromObject(version), observed) == nil
+	}, time.Second, 10*time.Millisecond)
+	opts := infra.ClaimSandboxOptions{Template: version.Name, User: "test-user"}
+	sbx, _, err := newSandboxFromSandboxSet(t.Context(), opts, instance.Cache)
+	require.NoError(t, err)
+	assert.Equal(t, "analysis", sbx.Labels["project"])
+	assert.Equal(t, "worker", sbx.Annotations["description"])
+	require.NoError(t, modifyPickedSandbox(sbx, infra.LockTypeCreate, opts))
+	assert.Equal(t, "analysis", sbx.Labels["project"])
+	assert.Equal(t, "worker", sbx.Annotations["description"])
+	assert.Empty(t, sbx.Spec.Template.Labels["project"])
+	assert.Empty(t, sbx.Spec.Template.Annotations["description"])
+}

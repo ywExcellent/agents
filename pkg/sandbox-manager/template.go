@@ -30,7 +30,10 @@ import (
 )
 
 // TemplateSummary is a business observation, not an HTTP response model.
-type TemplateSummary struct{ Name, ID, Status, Message string }
+type TemplateSummary struct {
+	Name, ID, Status, Message string
+	Metadata                  templateconfig.Metadata
+}
 
 func (m *SandboxManager) templateBackend() (infra.TemplateStore, error) {
 	if p, ok := m.infra.(infra.TemplateStoreProvider); ok && p.GetTemplateStore() != nil {
@@ -84,7 +87,7 @@ func (m *SandboxManager) CreateTemplate(ctx context.Context, ns, name string, d 
 	if err != nil {
 		return TemplateSummary{}, managererrors.WrapError(managererrors.ErrorInternal, err, "Unable to allocate template ID.")
 	}
-	claim, err := store.CreateClaim(ctx, ns, name, id)
+	claim, err := store.CreateClaim(ctx, ns, name, id, normalized.Metadata)
 	if err != nil {
 		return TemplateSummary{}, templateDomainError(err)
 	}
@@ -92,12 +95,13 @@ func (m *SandboxManager) CreateTemplate(ctx context.Context, ns, name string, d 
 		domain := templateDomainError(err)
 		return TemplateSummary{}, managererrors.WrapError(managererrors.GetErrCode(domain), err, "Template creation did not complete; query the name and explicitly delete partial resources before retrying.")
 	}
-	return TemplateSummary{Name: name, ID: id, Status: "Pending"}, nil
+	return TemplateSummary{Name: name, ID: id, Status: "Pending", Metadata: normalized.Metadata.Clone()}, nil
 }
 func templateSummary(c infra.TemplateClaimObservation, v *infra.TemplateVersionObservation) TemplateSummary {
-	s := TemplateSummary{Name: c.Identity.Name, Status: "Unknown"}
+	s := TemplateSummary{Name: c.Identity.Name, Status: "Unknown", Metadata: c.Metadata.Clone()}
 	if v != nil {
 		s.ID, s.Status, s.Message = v.ID, v.Phase, v.Message
+		s.Metadata = v.Metadata.Clone()
 	}
 	if c.Deleting || v != nil && v.Deleting {
 		s.Status, s.Message = "Deleting", ""

@@ -36,12 +36,14 @@ var (
 // TemplateClaimIdentity pins one incarnation of a logical name. UID is internal.
 type TemplateClaimIdentity struct{ Namespace, Name, UID string }
 type TemplateClaimObservation struct {
+	Metadata templateconfig.Metadata
 	Identity TemplateClaimIdentity
 	Deleting bool
 }
 
 // TemplateVersionObservation contains current definition observations, with a message only on failure.
 type TemplateVersionObservation struct {
+	Metadata           templateconfig.Metadata
 	ID, Phase, Message string
 	CreatedAt          time.Time
 	Deleting           bool
@@ -52,7 +54,7 @@ type TemplateVersionObservation struct {
 type TemplateStore interface {
 	Run(context.Context) error
 	Stop(context.Context)
-	CreateClaim(context.Context, string, string, string) (TemplateClaimIdentity, error)
+	CreateClaim(context.Context, string, string, string, templateconfig.Metadata) (TemplateClaimIdentity, error)
 	CreateVersion(context.Context, TemplateClaimIdentity, string, templateconfig.Definition) error
 	GetClaim(context.Context, string, string) (*TemplateClaimObservation, error)
 	ListClaims(context.Context, string) ([]TemplateClaimObservation, error)

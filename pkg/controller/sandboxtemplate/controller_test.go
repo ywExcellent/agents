@@ -297,3 +297,99 @@ func TestTemplateVersionConfirmsOnlyNegativeClaimObservations(t *testing.T) {
 		})
 	}
 }
+
+func TestTemplateCompanionMetadata(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		auto, external bool
+	}{{name: "fixed"}, {name: "automatic", auto: true}, {name: "external collision", external: true}} {
+		t.Run(tt.name, func(t *testing.T) {
+			c, v := fixture()
+			v.Labels = map[string]string{"app.kubernetes.io/name": "worker", "agents.kruise.io/internal": "secret"}
+			v.Annotations = map[string]string{"description": "analysis worker", "sandbox.agents.kruise.io/hash-immutable-part": "secret"}
+			v.Spec.Template.Labels = map[string]string{"pod-only": "pod"}
+			v.Spec.Template.Annotations = map[string]string{"pod-description": "pod"}
+			if tt.auto {
+				v.Spec.BuildOptions.WarmPool.Autoscaler = &api.SandboxTemplatePoolAutoscalerOptions{MinReplicas: 1, MaxReplicas: 10, CapacityPolicy: &api.CapacityPolicy{TargetAvailable: intstr.FromInt32(2)}}
+			}
+			objects := []client.Object{c, v}
+			if tt.external {
+				objects = append(objects, &api.SandboxSet{ObjectMeta: metav1.ObjectMeta{Name: v.Name, Namespace: v.Namespace, Labels: map[string]string{"external": "true"}}})
+			}
+			backend, scheme := fixtureClient(t, objects...)
+			r := &Reconciler{Client: backend, Reader: backend, Scheme: scheme}
+			req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(v)}
+			for round := 0; round < 3; round++ {
+				err := r.ensureCompanions(t.Context(), v)
+				p := &api.SandboxSet{}
+				if getErr := backend.Get(t.Context(), req.NamespacedName, p); getErr != nil {
+					t.Fatal(getErr)
+				}
+				if tt.external {
+					if err == nil || len(p.Labels) != 1 || p.Labels["external"] != "true" || len(p.Annotations) != 0 {
+						t.Fatalf("external adopted: %+v error=%v", p.ObjectMeta, err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if p.Labels["app.kubernetes.io/name"] != "worker" || p.Annotations["description"] != "analysis worker" || p.Annotations["sandbox.agents.kruise.io/hash-immutable-part"] != "" || p.Labels["agents.kruise.io/internal"] != "" {
+					t.Fatalf("pool metadata=%+v", p.ObjectMeta)
+				}
+				if round == 1 && tt.auto && p.Spec.Replicas != 7 {
+					t.Fatal("metadata repair reset automatic replicas")
+				}
+				sbx, err := pool.NewSandboxFromSandboxSet(p, v, v)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if sbx.Labels["app.kubernetes.io/name"] != "worker" || sbx.Annotations["description"] != "analysis worker" || sbx.Labels["agents.kruise.io/internal"] != "" || sbx.Annotations["sandbox.agents.kruise.io/hash-immutable-part"] != "" {
+					t.Fatalf("sandbox metadata=%+v", sbx.ObjectMeta)
+				}
+				if sbx.Spec.Template.Labels["app.kubernetes.io/name"] != "" || sbx.Spec.Template.Annotations["description"] != "" || sbx.Spec.Template.Labels["pod-only"] != "pod" {
+					t.Fatal("root metadata polluted PodTemplate")
+				}
+				sbx.Labels["app.kubernetes.io/name"] = "changed"
+				sbx.Annotations["description"] = "changed"
+				if p.Labels["app.kubernetes.io/name"] != "worker" || v.Labels["app.kubernetes.io/name"] != "worker" || p.Annotations["description"] != "analysis worker" || v.Annotations["description"] != "analysis worker" {
+					t.Fatal("materialization aliased informer maps")
+				}
+				if tt.auto {
+					pa := &api.PoolAutoscaler{}
+					if err := backend.Get(t.Context(), req.NamespacedName, pa); err != nil {
+						t.Fatal(err)
+					}
+					if len(pa.Labels) != 0 || len(pa.Annotations) != 0 {
+						t.Fatal("metadata escaped into autoscaler")
+					}
+				}
+				if round == 0 {
+					p.Labels["app.kubernetes.io/name"] = "drifted"
+					p.Annotations["description"] = "drifted"
+					p.Annotations["agents.kruise.io/existing"] = "keep"
+					p.Labels["external-added"] = "keep"
+					if tt.auto {
+						p.Spec.Replicas = 7
+					}
+					if err := backend.Update(t.Context(), p); err != nil {
+						t.Fatal(err)
+					}
+				} else if round == 1 {
+					if p.Annotations["agents.kruise.io/existing"] != "keep" || p.Labels["external-added"] != "keep" {
+						t.Fatal("metadata repair removed unrelated fields")
+					}
+					if err := backend.Delete(t.Context(), p); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			external := &api.SandboxSet{ObjectMeta: metav1.ObjectMeta{Name: "external", Namespace: v.Namespace, Labels: map[string]string{"pool-root": "not-inherited"}}, Spec: api.SandboxSetSpec{}}
+			external.Spec.TemplateRef = &api.SandboxTemplateRef{Name: v.Name}
+			sbx, err := pool.NewSandboxFromSandboxSet(external, v, nil)
+			if err != nil || sbx.Labels["app.kubernetes.io/name"] != "" || sbx.Annotations["description"] != "" || sbx.Labels["pool-root"] != "" || sbx.Labels["pod-only"] != "pod" {
+				t.Fatalf("non-companion behavior changed, sandbox=%+v error=%v", sbx, err)
+			}
+		})
+	}
+}

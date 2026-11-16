@@ -51,6 +51,25 @@ func NewSandboxFromSandboxSet(sbs *agentsv1alpha1.SandboxSet, refTemplate, owner
 		inheritedLabels = maps.Clone(template.Labels)
 		inheritedAnnotations = maps.Clone(template.Annotations)
 	}
+	// ResolveTemplateSpec has validated the complete owner/reference identity.
+	// Root business metadata is inherited only for genuine custom companions;
+	// legacy/external pools and the PodTemplate keep their existing behavior.
+	owner := templateindex.VersionOwnerReference(sbs)
+	if owner != nil && refTemplate != nil && owner.UID == refTemplate.UID && templateindex.ClaimOwnerReference(refTemplate) != nil {
+		metadata := templateconfig.UserMetadata(refTemplate.Labels, refTemplate.Annotations)
+		if len(metadata.Labels) > 0 {
+			if inheritedLabels == nil {
+				inheritedLabels = map[string]string{}
+			}
+			maps.Copy(inheritedLabels, metadata.Labels)
+		}
+		if len(metadata.Annotations) > 0 {
+			if inheritedAnnotations == nil {
+				inheritedAnnotations = map[string]string{}
+			}
+			maps.Copy(inheritedAnnotations, metadata.Annotations)
+		}
+	}
 	if sbs.Spec.Template == nil && refTemplate != nil && refTemplate.Spec.Template != nil {
 		templateName = refTemplate.Name
 	}
@@ -91,7 +110,6 @@ func NewSandboxFromSandboxSet(sbs *agentsv1alpha1.SandboxSet, refTemplate, owner
 	// A blocking, non-controller version owner makes foreground template cleanup
 	// wait for undelivered inventory even after pool loss. Native claim delivery
 	// removes all owners, so already-delivered Sandboxes stay independent.
-	owner := templateindex.VersionOwnerReference(sbs)
 	if owner != nil && refTemplate != nil && owner.UID == refTemplate.UID && templateindex.ClaimOwnerReference(refTemplate) != nil {
 		sbx.OwnerReferences = append(sbx.OwnerReferences, metav1.OwnerReference{APIVersion: agentsv1alpha1.GroupVersion.String(), Kind: "SandboxTemplate", Name: refTemplate.Name, UID: refTemplate.UID, Controller: ptr.To(false), BlockOwnerDeletion: ptr.To(true)})
 	}

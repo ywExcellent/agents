@@ -24,6 +24,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	apivalidation "k8s.io/apimachinery/pkg/api/validation"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
@@ -87,12 +88,24 @@ func templateStoreError(err error) error {
 		return fmt.Errorf("template backend operation: %w", err)
 	}
 }
-func (s *templateStore) CreateClaim(ctx context.Context, ns, name, id string) (infra.TemplateClaimIdentity, error) {
+func (s *templateStore) CreateClaim(ctx context.Context, ns, name, id string, metadata templateconfig.Metadata) (infra.TemplateClaimIdentity, error) {
 	if err := s.check(ctx, ns); err != nil {
 		return infra.TemplateClaimIdentity{}, err
 	}
+	metadata = metadata.Clone()
+	if metadata.Annotations == nil {
+		metadata.Annotations = map[string]string{}
+	}
+	metadata.Annotations[templatecreation.AllocationAnnotation] = id
+	// Reserve the completion marker before the first write, so a full user map
+	// cannot prevent the creator from publishing positive completion evidence.
+	metadata.Annotations[templatecreation.CreationCompleteAnnotation] = "true"
+	if err := apivalidation.ValidateAnnotationsSize(metadata.Annotations); err != nil {
+		return infra.TemplateClaimIdentity{}, fmt.Errorf("%w: %w", infra.ErrTemplateInvalid, err)
+	}
+	delete(metadata.Annotations, templatecreation.CreationCompleteAnnotation)
 	c := &api.SandboxTemplateClaim{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name,
-		Finalizers: []string{api.SandboxTemplateClaimCleanupFinalizer}, Annotations: map[string]string{templatecreation.AllocationAnnotation: id}}}
+		Finalizers: []string{api.SandboxTemplateClaimCleanupFinalizer}, Labels: metadata.Labels, Annotations: metadata.Annotations}}
 	if err := s.writer.Create(ctx, c, &client.CreateOptions{FieldValidation: metav1.FieldValidationStrict}); err != nil {
 		if apierrors.IsNotFound(err) {
 			return infra.TemplateClaimIdentity{}, fmt.Errorf("%w: %w", infra.ErrTemplateViewUnavailable, err)
@@ -121,7 +134,8 @@ func (s *templateStore) CreateVersion(ctx context.Context, c infra.TemplateClaim
 	if err := writeCtx.Err(); err != nil {
 		return templateStoreError(err)
 	}
-	v := &api.SandboxTemplate{ObjectMeta: metav1.ObjectMeta{Namespace: c.Namespace, Name: id,
+	metadata := d.Metadata.Clone()
+	v := &api.SandboxTemplate{ObjectMeta: metav1.ObjectMeta{Namespace: c.Namespace, Name: id, Labels: metadata.Labels, Annotations: metadata.Annotations,
 		OwnerReferences: []metav1.OwnerReference{{APIVersion: api.GroupVersion.String(), Kind: "SandboxTemplateClaim", Name: c.Name, UID: types.UID(c.UID), Controller: ptr.To(true), BlockOwnerDeletion: ptr.To(true)}}}, Spec: *d.TemplateSpec()}
 	err := s.writer.Create(writeCtx, v, &client.CreateOptions{FieldValidation: metav1.FieldValidationStrict})
 	if err != nil {
@@ -150,7 +164,7 @@ func (s *templateStore) GetClaim(ctx context.Context, ns, name string) (*infra.T
 	if err := s.live.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, c); err != nil {
 		return nil, templateStoreError(err)
 	}
-	return &infra.TemplateClaimObservation{Identity: infra.TemplateClaimIdentity{Namespace: c.Namespace, Name: c.Name, UID: string(c.UID)}, Deleting: c.DeletionTimestamp != nil}, nil
+	return &infra.TemplateClaimObservation{Identity: infra.TemplateClaimIdentity{Namespace: c.Namespace, Name: c.Name, UID: string(c.UID)}, Deleting: c.DeletionTimestamp != nil, Metadata: templateconfig.UserMetadata(c.Labels, c.Annotations)}, nil
 }
 func (s *templateStore) ListClaims(ctx context.Context, ns string) ([]infra.TemplateClaimObservation, error) {
 	if err := s.check(ctx, ns); err != nil {
@@ -162,7 +176,7 @@ func (s *templateStore) ListClaims(ctx context.Context, ns string) ([]infra.Temp
 	}
 	out := make([]infra.TemplateClaimObservation, 0, len(list.Items))
 	for _, c := range list.Items {
-		out = append(out, infra.TemplateClaimObservation{Identity: infra.TemplateClaimIdentity{Namespace: c.Namespace, Name: c.Name, UID: string(c.UID)}, Deleting: c.DeletionTimestamp != nil})
+		out = append(out, infra.TemplateClaimObservation{Identity: infra.TemplateClaimIdentity{Namespace: c.Namespace, Name: c.Name, UID: string(c.UID)}, Deleting: c.DeletionTimestamp != nil, Metadata: templateconfig.UserMetadata(c.Labels, c.Annotations)})
 	}
 	return out, nil
 }
@@ -188,7 +202,7 @@ func ownedTemplate(v *api.SandboxTemplate, c infra.TemplateClaimIdentity) bool {
 	return v.Namespace == c.Namespace && o != nil && o.Name == c.Name && string(o.UID) == c.UID
 }
 func observeTemplateVersion(v *api.SandboxTemplate) infra.TemplateVersionObservation {
-	o := infra.TemplateVersionObservation{ID: v.Name, Phase: string(api.SandboxTemplatePhasePending), CreatedAt: v.CreationTimestamp.Time, Deleting: v.DeletionTimestamp != nil}
+	o := infra.TemplateVersionObservation{Metadata: templateconfig.UserMetadata(v.Labels, v.Annotations), ID: v.Name, Phase: string(api.SandboxTemplatePhasePending), CreatedAt: v.CreationTimestamp.Time, Deleting: v.DeletionTimestamp != nil}
 	switch phase := templatecreation.DefinitionPhase(v); {
 	case phase == api.SandboxTemplatePhaseFailed:
 		o.Phase, o.Message = string(phase), meta.FindStatusCondition(v.Status.Conditions, templatecreation.DefinitionCondition).Message

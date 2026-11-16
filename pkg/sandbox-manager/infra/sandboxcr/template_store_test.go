@@ -21,11 +21,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apivalidation "k8s.io/apimachinery/pkg/api/validation"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -146,11 +148,12 @@ func TestTemplateStorePersistedFinalizersAndPartialFailure(t *testing.T) {
 				return c.Create(ctx, o, options...)
 			}})
 			s := &templateStore{cached: base, writer: writer, live: base}
-			claim, err := s.CreateClaim(t.Context(), "team-a", "python-agent", templateTestID)
+			metadata := templateconfig.Metadata{Labels: map[string]string{"project": "analysis"}, Annotations: map[string]string{"description": "worker"}}
+			claim, err := s.CreateClaim(t.Context(), "team-a", "python-agent", templateTestID, metadata)
 			if err != nil {
 				t.Fatal(err)
 			}
-			d, err := templateconfig.NormalizeDefinition(templateconfig.Definition{Pod: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "python:3.12"}}}})
+			d, err := templateconfig.NormalizeDefinition(templateconfig.Definition{Metadata: metadata, Pod: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "python:3.12"}}}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -161,6 +164,9 @@ func TestTemplateStorePersistedFinalizersAndPartialFailure(t *testing.T) {
 			persisted := &api.SandboxTemplateClaim{}
 			if err := base.Get(t.Context(), client.ObjectKey{Namespace: claim.Namespace, Name: claim.Name}, persisted); err != nil {
 				t.Fatal(err)
+			}
+			if persisted.Labels["project"] != "analysis" || persisted.Annotations["description"] != "worker" {
+				t.Fatalf("claim lost user metadata: %+v", persisted.ObjectMeta)
 			}
 			if len(persisted.Finalizers) != 1 || persisted.Annotations[templatecreation.AllocationAnnotation] != templateTestID {
 				t.Fatalf("claim=%+v", persisted)
@@ -174,6 +180,35 @@ func TestTemplateStorePersistedFinalizersAndPartialFailure(t *testing.T) {
 			version := &api.SandboxTemplate{}
 			if err := base.Get(t.Context(), client.ObjectKey{Namespace: claim.Namespace, Name: templateTestID}, version); err != nil {
 				t.Fatal(err)
+			}
+			if version.Labels["project"] != "analysis" || version.Annotations["description"] != "worker" || len(version.Spec.Template.Labels) != 0 || len(version.Spec.Template.Annotations) != 0 {
+				t.Fatalf("version metadata projection wrong: %+v", version)
+			}
+			d.Metadata.Labels["project"] = "changed"
+			metadata.Annotations["description"] = "changed"
+			for _, listMode := range []bool{false, true} {
+				var observations []infra.TemplateClaimObservation
+				if listMode {
+					observations, err = s.ListClaims(t.Context(), claim.Namespace)
+				} else {
+					var observation *infra.TemplateClaimObservation
+					observation, err = s.GetClaim(t.Context(), claim.Namespace, claim.Name)
+					if observation != nil {
+						observations = append(observations, *observation)
+					}
+				}
+				if err != nil || len(observations) != 1 || len(observations[0].Metadata.Labels) != 1 || len(observations[0].Metadata.Annotations) != 1 || observations[0].Metadata.Annotations["description"] != "worker" {
+					t.Fatalf("claim observation=%+v error=%v", observations, err)
+				}
+				observations[0].Metadata.Labels["project"] = "changed"
+			}
+			versions, err := s.ListVersions(t.Context(), claim)
+			if err != nil || len(versions) != 1 || versions[0].Metadata.Labels["project"] != "analysis" || versions[0].Metadata.Annotations["description"] != "worker" {
+				t.Fatalf("versions=%+v error=%v", versions, err)
+			}
+			single, err := s.GetVersion(t.Context(), claim, templateTestID)
+			if err != nil || single.Metadata.Labels["project"] != "analysis" {
+				t.Fatalf("version=%+v error=%v", single, err)
 			}
 			if len(version.Finalizers) != 0 || version.OwnerReferences[0].UID != persisted.UID || !ptr.Deref(version.OwnerReferences[0].BlockOwnerDeletion, false) || version.Spec.BuildOptions.WarmPool.Size == nil {
 				t.Fatalf("version=%+v", version)
@@ -370,5 +405,59 @@ func TestTemplateViewStopBeforeRun(t *testing.T) {
 	v.Stop(t.Context())
 	if err := v.Run(t.Context()); err == nil {
 		t.Fatal("stop-before-start must reject late startup")
+	}
+}
+
+func TestTemplateMetadataAnnotationBudgetBeforePersistence(t *testing.T) {
+	allocationSize := len(templatecreation.AllocationAnnotation) + len(templateTestID)
+	completionSize := len(templatecreation.CreationCompleteAnnotation) + len("true")
+	for _, test := range []struct {
+		name           string
+		annotationSize int
+		invalid        bool
+	}{
+		{name: "allocation exceeds native budget", annotationSize: apivalidation.TotalAnnotationSizeLimitB, invalid: true},
+		{name: "completion exceeds native budget", annotationSize: apivalidation.TotalAnnotationSizeLimitB - allocationSize, invalid: true},
+		{name: "both markers exactly fit", annotationSize: apivalidation.TotalAnnotationSizeLimitB - allocationSize - completionSize},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base := templateTestClient(t)
+			store := &templateStore{cached: base, writer: base, live: base}
+			metadata := templateconfig.Metadata{Annotations: map[string]string{"x": strings.Repeat("a", test.annotationSize-len("x"))}}
+			identity, err := store.CreateClaim(t.Context(), "team-a", "demo", templateTestID, metadata)
+			persisted := &api.SandboxTemplateClaim{}
+			key := client.ObjectKey{Namespace: "team-a", Name: "demo"}
+			if test.invalid {
+				if !errors.Is(err, infra.ErrTemplateInvalid) {
+					t.Fatalf("error=%v", err)
+				}
+				if err := base.Get(t.Context(), key, persisted); !apierrors.IsNotFound(err) {
+					t.Fatalf("unexpected partial claim, error=%v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := base.Get(t.Context(), key, persisted); err != nil {
+				t.Fatal(err)
+			}
+			if persisted.Annotations[templatecreation.CreationCompleteAnnotation] != "" {
+				t.Fatal("completion marker published before version persistence")
+			}
+			d := templateconfig.Definition{Metadata: metadata, Pod: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "python:3.12"}}}}
+			if err := store.CreateVersion(t.Context(), identity, templateTestID, d); err != nil {
+				t.Fatal(err)
+			}
+			if err := base.Get(t.Context(), key, persisted); err != nil {
+				t.Fatal(err)
+			}
+			if persisted.Annotations[templatecreation.CreationCompleteAnnotation] != "true" || persisted.Annotations[templatecreation.AllocationAnnotation] != templateTestID {
+				t.Fatal("creation markers were not persisted")
+			}
+			if err := apivalidation.ValidateAnnotationsSize(persisted.Annotations); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

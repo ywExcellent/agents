@@ -27,6 +27,7 @@ import (
 // Definition is workload and companion intent, not a persisted CR or transport
 // model. Existing policy value types are reused without exposing CR metadata.
 type Definition struct {
+	Metadata             Metadata
 	Pod                  corev1.PodSpec
 	VolumeClaimTemplates []corev1.PersistentVolumeClaim
 	PersistentContents   []string
@@ -51,10 +52,11 @@ func (d Definition) TemplateSpec() *api.SandboxTemplateSpec {
 // NormalizeDefinition is read-free and does not mutate input.
 func NormalizeDefinition(d Definition) (Definition, error) {
 	s, errs := templatevalidation.NormalizeCustomSpec(d.TemplateSpec(), field.NewPath("spec"))
+	errs = append(errs, ValidateMetadata(d.Metadata, field.NewPath("metadata"))...)
 	if len(errs) > 0 {
 		return Definition{}, errs.ToAggregate()
 	}
-	return Definition{Pod: s.Template.Spec, VolumeClaimTemplates: s.VolumeClaimTemplates,
+	return Definition{Metadata: d.Metadata.Clone(), Pod: s.Template.Spec, VolumeClaimTemplates: s.VolumeClaimTemplates,
 		PersistentContents: s.PersistentContents, Runtimes: s.Runtimes, PauseStrategy: s.PauseStrategy,
 		Probes: s.Probes, AutoPausePolicy: s.AutoPausePolicy, Lifecycle: s.Lifecycle, WarmPool: s.BuildOptions.WarmPool}, nil
 }

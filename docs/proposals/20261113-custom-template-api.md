@@ -32,6 +32,7 @@ This proposal defines an additive custom API, not a rewrite of the existing E2B 
 - [Implementation Details](#implementation)
 - [Security, Risks, and Mitigations](#risks)
 - [Upgrade Strategy](#upgrade)
+- [Future Work](#future-work)
 - [Test Plan](#test-plan)
 - [References](#references)
 
@@ -96,7 +97,8 @@ This release does not provide:
 - Separate pool/autoscaler SDKs, management or status APIs, public scaling, or suspend.
 - Pagination, list filtering, idempotency keys, new quota mechanisms, or new Prometheus metrics.
 - Distributed locks, write barriers, in-flight counters, or draining across deletion, consumption, claiming, and external references.
-- User-defined root metadata, namespace, UID, target team, or a separate DisplayName.
+- Arbitrary root ObjectMeta (name/namespace/UID/owners/finalizers/status), target team, or a separate DisplayName. Root business labels/annotations are supported through a restricted metadata object.
+- Public/private visibility, cross-team discovery or copying, and root `fromTemplate` input; see the [future sharing direction](#future-work).
 - A new public SDK client, URL, or port option, or expanded legacy E2B Template compatibility.
 
 <a id="proposal"></a>
@@ -359,7 +361,7 @@ type SandboxTemplatePoolAutoscalerOptions struct {
 
 Retain `fromTemplate`, `steps`, `startCommand`, `readyCommand`, their command types, CRD schema, and DeepCopy support. The custom API rejects and does not generate them; their existing E2B use remains unchanged.
 
-SandboxSet and PoolAutoscaler reuse their existing CRs, without new public identity or status fields. See the source types linked below for their full definitions. A companion pool declares capacity and an explicit kind/apiVersion templateRef only; the system supplies metadata/ownership, without duplicated inline workload or policy copies.
+SandboxSet and PoolAutoscaler reuse their existing CRs, without new public identity or status fields. See the source types linked below for their full definitions. A companion pool spec declares capacity and an explicit kind/apiVersion templateRef only; the system supplies native root business metadata/ownership, without duplicated inline workload or policy copies.
 
 <a id="interface-design"></a>
 
@@ -390,18 +392,98 @@ No namespace or target-team input is accepted. Do not treat admin's empty namesp
 
 #### Request Fields
 
-Only `name`, `spec`, and `options` are accepted at the root. name/spec are required; options may be omitted or null.
+Only `name`, `metadata`, `spec`, and `options` are accepted at the root. name/spec are required; metadata/options may be omitted or null. metadata accepts labels/annotations only; it is not a full Kubernetes ObjectMeta input.
 
 | Input | Mapping |
 | --- | --- |
+| metadata.labels / metadata.annotations | Native root ObjectMeta on Claim and version; mirrored onto the genuine companion SandboxSet and inherited onto Sandbox root metadata only |
 | Standard PodSpec fields in spec | Flat input maps to version.spec.template.spec; retain standard workload capabilities, without a Pod metadata wrapper |
 | volumeClaimTemplates | Maps to native PVC templates; public nested input accepts metadata.name/spec only |
 | persistentContents, runtimes, pauseStrategy, probes, autoPausePolicy, lifecycle | Corresponding version fields; template lifecycle excludes preUpgrade/postUpgrade |
 | options.warmPool | version.spec.buildOptions.warmPool; not stored on Claim or exposed inside workload spec |
 
-Users cannot set backend, templateId, buildId, root metadata/namespace/UID, status, companion resource names, owner, or scaleTargetRef. The system writes backend=k8s.
+Users cannot set backend, templateId, buildId, other root ObjectMeta fields, namespace/UID, status, companion resource names, owner, or scaleTargetRef. The system writes backend=k8s.
 
 **Why PVC labels/annotations are rejected:** Kubernetes PVCs support them. This is a deliberate custom-API scope restriction because current materialization generates Name/Namespace/owner and copies Spec but does not propagate template labels/annotations. Returning 400 avoids accepting and persisting configuration that has no runtime effect. Future support requires controlled propagation, format and reserved-system-key validation, and defined behavior for existing/retained reusable PVCs, not just a wider DTO or wholesale ObjectMeta copying. Preserve the complete native CR PVC fields.
+
+#### Business Metadata Contract
+
+```json
+{
+  "name": "worker",
+  "metadata": {
+    "labels": {"app.kubernetes.io/name": "worker", "project": "analysis"},
+    "annotations": {"description": "Python workload"}
+  },
+  "spec": {"containers": [{"name": "main", "image": "python:3.12"}]}
+}
+```
+
+- `metadata` omitted, null, or `{}` means no user entries. When present,
+  labels/annotations must be JSON objects with string keys and values; null maps,
+  null values, arrays, non-string values, unknown keys, duplicate keys, and wrong
+  case are 400. Explicit empty string label values remain valid.
+- Use Kubernetes label-key/value and annotation-key validation. Annotation values
+  are arbitrary strings; custom root annotations are limited to 64 KiB in total
+  (keys and values), leaving 192 KiB of the native budget for runtime system fields.
+  Later Sandbox requests must still fit the native 256 KiB aggregate limit.
+  The concrete writer also checks the Claim's internal allocation and future
+  completion marker against that limit **before reserving the name**; a user map
+  that leaves no room for those markers is 400 without a partial Claim.
+- Keys with domain `agents.kruise.io` or any of its subdomains (case-insensitive
+  for annotations), including E2B and Sandbox revision-hash keys, are reserved.
+  They are rejected on input and excluded from public metadata projection and
+  propagation. Standard application labels such as `app.kubernetes.io/name` are
+  accepted. Do not treat the input as permission to set name, namespace, UID,
+  ownerReferences, finalizers, resourceVersion, or any other ObjectMeta field.
+- Store independent copies in native Claim and version ObjectMeta. This adds no
+  CR spec fields or CRD schema changes. Claim remains metadata-only and cannot
+  reconstruct a lost workload. Query an empty Claim using its business maps;
+  query a selected/latest version using that version's maps.
+- POST/GET/LIST return optional `metadata` containing non-reserved business
+  labels/annotations. Omit empty maps/the entire empty object; internal creation,
+  runtime, identity and controller fields are not exposed. Non-reserved metadata
+  added by privileged admission/CR writers follows the same projection; the
+  API does not maintain a separate author-supplied key ledger.
+- On companion Create/recreation, copy approved version root maps to SandboxSet
+  root. Reconcile the version's declared keys without removing unrelated
+  controller/admission additions or changing auto-mode replica ownership. Never
+  adopt or modify a colliding external SandboxSet.
+- Both inventory and cold-created Sandboxes use the existing shared materializer.
+  After it validates the full genuine companion identity (namespace, actual
+  version-owner UID, explicit templateRef and names), merge the version's business
+  maps into **Sandbox root**. The version snapshot is authoritative; unrelated
+  metadata added only to a pool is not implicitly inherited. Keep existing system
+  identity stamping and independent maps. Non-companion/legacy inheritance is
+  unchanged.
+- Do **not** inject these maps into PodTemplate/Pod, PVC, Checkpoint,
+  PoolAutoscaler or TrafficPolicy. Pod admission/controller behavior must not
+  change merely because users classify templates. Existing independent metadata
+  paths for those resources remain unchanged.
+- Existing Sandbox consumption retains inherited business keys. Request-level
+  annotations/extension labels may override matching business keys under current
+  semantics; this iteration adds no new immutable business-key or selector-label
+  protection. Existing system identity validation/stamping remains unchanged.
+  Delivered Sandboxes keep their copied metadata after owners are detached and
+  after template deletion. There is no update/PATCH or metadata backfill contract
+  for already-created/delivered Sandboxes.
+
+Python accepts the same restricted dictionary rather than a new SDK client or
+native ObjectMeta model:
+
+```python
+template = Template.build(
+    name="worker", spec=spec,
+    metadata={"labels": {"project": "analysis"},
+              "annotations": {"description": "Python workload"}},
+)
+print(template.metadata)
+```
+
+The SDK validates object shape, string types and reserved domains before HTTP;
+Kubernetes syntax/size checks are authoritative at the backend. Response parsing
+rejects malformed/system metadata and uses an empty dictionary for older responses
+without metadata. Polling refreshes metadata together with status.
 
 #### warmPool and Autoscaler Options
 
@@ -431,7 +513,7 @@ Distinguish field absence from explicit zero during validation/defaulting, then 
 }
 ```
 
-Success summaries contain name, templateId, status, and an optional message only for definition Failed. Empty Claim returns templateId=null, not an omitted field. Do not return namespace, spec/options, backend, artifacts, conditions, timestamps, buildId, an extra state, or child-status wrappers.
+Success summaries contain name, templateId, status, and an optional message only for definition Failed. Empty Claim returns templateId=null, not an omitted field. Optional metadata exposes only non-reserved business maps; omit it when empty. Do not return namespace, spec/options, backend, artifacts, conditions, timestamps, buildId, an extra state, or child-status wrappers.
 
 Errors have a flat message, integer HTTP code, and request_id:
 
@@ -447,10 +529,10 @@ Errors have a flat message, integer HTTP code, and request_id:
 | --- | --- |
 | 201 | Claim and full version persisted; Pending snapshot and Location |
 | 200 | Query success, including Unknown/Failed/Deleting |
-| 204 | Synchronous cleanup complete, or scoped absence with required cleanup confirmed |
+| 204 | Synchronous cleanup complete, or the current-team Claim is live-confirmed absent (DELETE is idempotent) |
 | 400 | Invalid shape/name/type or unsupported fields/parameters |
 | 401 / 403 | Invalid credentials / valid credentials without permission for the new API |
-| 404 | Current-team Claim or specified owned version truly absent |
+| 404 | GET of a current-team Claim or specified owned version that is truly absent |
 | 409 | Existing same-name Claim, confirmed resource conflict, or external reference before deletion |
 | 503 | Deletion not complete, temporary backend failure, or cleanup completion not yet confirmable |
 | 500 | Non-transient internal failure; not evidence that partial creation was rolled back |
@@ -677,6 +759,7 @@ Acceptance and controller revalidation of the persisted current generation share
 | Area | Static checks |
 | --- | --- |
 | PodTemplate / PodSpec | Valid workload containers, names, nonempty image, and Kubernetes rules for resources/ports/mounts; no mandatory registry prefix/digest |
+| Root business metadata (acceptance only) | Restricted maps, Kubernetes syntax/size, reserved domains, and space for internal creation markers; native root controller metadata is not globally revalidated as user input |
 | PVC | Public metadata.name/spec, valid unique base names, defaulted PVC spec, mount references, and collisions with ordinary volumes |
 | runtimes | RuntimeConfig currently contains name only; nonempty/unique names and supported csi, agent-runtime, traffic-proxy; not container references |
 | persistentContents / pauseStrategy | Explicit ip/memory/filesystem, Stop/Hibernate, Snapshot values; omitted values retain existing default handling |
@@ -788,7 +871,7 @@ The version's native `foregroundDeletion` finalizer is the durable cleanup barri
 
 204 does not wait for global image-cache GC, remove delivered Sandboxes/external resources, or force-delete shared/Retain PVCs. Incomplete/unconfirmable cleanup or wait timeout returns 503. A 500 does not restore removed objects. HTTP timeout, request exit, or process restart does not cancel durable cleanup. Progress cannot exist only in Manager memory/request snapshots.
 
-During the synchronous wait, a positive cache observation of the pinned Claim means cleanup is incomplete; do not repeatedly replace it with live reads. Cache absence or a changed UID requires a keyed live confirmation before returning 204. A replacement Claim is not part of the pinned deletion request and must not be deleted by its internal retries. Completion relies on the normal Claim-finalizer/native-foreground chain, including confirmation of the known allocated version, rather than an empty cached list or parent NotFound alone. Manual finalizer removal or forced deletion outside normal cleanup is outside this guarantee. Do not equate pool deletionTimestamp with completed inventory/Pod/PVC cleanup.
+During the synchronous wait, a positive cache observation of the pinned Claim means cleanup is incomplete; do not repeatedly replace it with live reads. Cache absence or a changed UID requires a keyed live confirmation before returning 204. A replacement Claim is not part of the pinned deletion request and must not be deleted by its internal retries. A live-confirmed Claim absence, whether observed by the pinned wait or by a new DELETE request, is completion evidence only because normal cleanup releases the Claim finalizer last, after its owned versions, including the known allocated version, are confirmed absent; a cached NotFound or an empty cached version list is not evidence. DELETE does not scan for versions, companions or inventory created, re-owned or detached outside the API; direct CR writes, manual finalizer removal and forced deletion are outside this guarantee. Do not equate pool deletionTimestamp with completed inventory/Pod/PVC cleanup.
 
 #### name DELETE Retry Boundary
 
@@ -838,7 +921,7 @@ An existing controller templateRef index is not automatically present in a new c
 
 Shared index extraction belongs in a truly neutral package. Do not reuse a registration package if its closure imports controller feature gates into sandbox-manager. Initial sync provides initial availability, not strongly consistent ongoing watches.
 
-The complete management view does not guarantee legacy consumption visibility: a companion that fails existing namespace/label filters may appear missing to consumption. Validate supported deployment configurations; do not generate user business labels implicitly, expose metadata, or cancel old filters to hide this limitation.
+The complete management view does not guarantee legacy consumption visibility: a companion that fails existing namespace/label filters may appear missing to consumption. Validate supported deployment configurations; callers must explicitly provide matching business labels through metadata.labels when their deployment requires them. Do not generate business labels implicitly or cancel old filters to hide this limitation. Template GET/LIST remain unfiltered current-team management views; this extension does not add a list selector.
 
 <a id="implementation"></a>
 
@@ -920,11 +1003,11 @@ The server uses `--custom-template-port` (default 0, disabled); the repository d
 | Partial failure leaves a reserved name | Atomic Claim finalizer/allocation, bounded creation grace, no hidden rollback/repair; query Unknown/actual version, then explicitly delete |
 | Request/process/controller exit loses cleanup | Claim cleanup finalizer plus native foregroundDeletion and blocking owner chain; timeout does not cancel durable cleanup |
 | No strong coordination permits concurrent failures/new invalid refs | Document races; no drain/reference transaction or sibling PA-to-pool cleanup ordering; keep delivered-owner-detachment and PVC retention protections |
-| Insufficient finalizer/GC completion evidence | Retain Claim until owned versions are confirmed absent; cache-positive waits then live absence/UID-change confirmation, not cached emptiness/parent NotFound alone |
+| Insufficient finalizer/GC completion evidence | Retain Claim until owned versions are confirmed absent; cache-positive waits then live absence/UID-change confirmation, never cached emptiness or a cached Claim NotFound; no scan for resources created or detached outside the API |
 | Obsolete custom version finalizers strand unreleased prototype resources | Controlled operator migration is required before upgrading; disabling the listener is not cleanup and finalizers must not be blindly removed |
 | Direct CR writes forge Claim ownerReferences on create | The trust model is API-key tenants without CR write permission; same-namespace CR writers already hold stronger rights. Orphaned/mismatched versions are foreground-deleted only after necessary live negative Claim UID confirmation. PA/pool owner matching is not an independent proof that the Claim/version still exists |
 
-Validate all input in team scope. Users cannot supply root metadata/system owners/scaling targets. Use existing structured logging/Events without new metrics, and never write sensitive keys/credentials into status.
+Validate all input in team scope. Users may supply validated root labels/annotations only, not other ObjectMeta fields, system owners, or scaling targets. Use existing structured logging/Events without new metrics, and never write sensitive keys/credentials into status.
 
 <a id="upgrade"></a>
 
@@ -939,6 +1022,122 @@ Validate all input in team scope. Users cannot supply root metadata/system owner
 - Rollback/mixed versions must retain working Claim-finalizer and native foreground cleanup for persisted resources. Disabling the listener or reverting code is not cleanup and does not replace the required prototype migration.
 - The resource model reserves future 1:N space only; rebuilding, tags, default-version publication, upgrades, and rollbacks are not implemented in this release.
 
+<a id="future-work"></a>
+
+## Future Work
+
+### Public and Private Templates with Copy-Based Consumption
+
+This is a future extension, not part of the current release or an authorization to
+implement it now. The intended direction is to let users choose public or private
+visibility when creating a template, and to let another team copy an accessible
+concrete version into its own namespace before consuming it. Direct Sandbox
+consumption of another team's public templateId is not part of this initial
+sharing extension; any later direct-consumption model requires a separate design.
+
+#### Candidate API Additions
+
+The following names and payload are illustrative future additions. Current POST
+still requires `name` and `spec`, accepts the restricted business `metadata` and existing `options` contracts,
+and rejects these unsupported fields through strict decoding.
+
+| Candidate create input | Intended meaning and default |
+| --- | --- |
+| `public` | Allow other authenticated teams to copy this template; default false. Public does not grant management rights or anonymous access. |
+| `fromTemplate` | Source concrete templateId; mutually exclusive with an inline workload `spec`. A Python argument, if added, would use `from_template`. |
+
+```json
+{
+  "name": "python-copy",
+  "public": false,
+  "fromTemplate": "a7f2k9m4p1q8r3s6t0v5",
+  "options": {
+    "warmPool": { "size": 2 }
+  }
+}
+```
+
+`fromTemplate` selects the creation source at the request root; it is not a
+companion option or a build command. Do not reuse the historical persisted
+`SandboxTemplateBuildOptions.FromTemplate` field for this copy contract. Custom
+API requests use `options.warmPool`; the resulting local declaration is persisted as
+`spec.buildOptions.warmPool`, as in the current API.
+
+#### Resource, Identity, and Lifecycle Direction
+
+- The source stays in its publisher's team namespace. Public visibility changes
+  access policy, not namespace, ownership, or the caller's team identity. A
+  central public namespace is not required when users can publish their own
+  templates.
+- Keep visibility separate from workload spec and companion options. Controlled
+  metadata is a possible representation that preserves the metadata-only Claim;
+  the exact persistence placement and keys are not finalized here.
+- Copy a concrete source templateId, not an unqualified cross-team name. Logical
+  template names may collide across teams, and future 1:N versions must not silently
+  switch the source during copying. Authorize the source's actual ownership and visibility; an ID
+  or a discoverability label alone is not authorization.
+- Eligible sources are the caller's own private versions or versions explicitly
+  accessible as public. Require a Ready, non-deleting version. Ready retains its
+  static-definition meaning; it does not establish image, dependency, or runtime
+  availability.
+- Create a new local Claim and allocate a fresh local 20-character templateId.
+  Persist a complete independent workload snapshot, not a runtime source ref.
+  The source ID and destination ID are distinct. Use the destination ID for
+  Sandbox consumption and local companion names.
+- Do not inherit the source's public visibility, warmPool declaration, or
+  autoscaler policies. The copied template is private unless explicitly requested
+  otherwise; apply the destination's own `options` and existing defaults.
+- Retain same-namespace ownership: the local version belongs to the local Claim;
+  its pool and autoscaler belong to the actual local version UID. Do not create
+  cross-namespace ownerReferences. Optional internal source provenance must not
+  become a runtime ref, default-version pointer, or deletion dependency.
+- Source changes, unpublishing, and source deletion do not update or cascade-delete
+  already copied templates, pools, or delivered Sandboxes. Deleting a copy does
+  not delete its source. Copying is not revocable live inheritance.
+- Reuse current immutable-create, name uniqueness, Pending response, version-bound
+  waiting, static Ready, partial-failure retention, and explicit local deletion
+  semantics. Do not add hidden repair or rollback as a side effect of copying.
+
+#### Security and Implementation Boundaries to Resolve Later
+
+- Public discovery/read routes must distinguish team-local names and concrete
+  source IDs without weakening current `/templates/{name}` management scope. Do
+  not use an empty namespace or pick the first matching resource from all teams.
+  A cross-namespace ID lookup must fail closed on ambiguity or incomplete scope.
+- Source inspection is a narrow, authorized read capability, not permission to
+  expose all private namespaces, source spec, credentials, or backend metadata.
+  Copy orchestration belongs in Manager; neutral source observations and complete
+  definition snapshots belong in Infra. Keep protocol input, authorization, and
+  HTTP mapping in API. Controllers continue to reconcile the local full snapshot
+  without depending on API or Manager.
+- Specify informer scope, indexes, readiness, and RBAC before cross-team lookup.
+  Existing single-namespace Template stores cannot read another namespace merely
+  because Manager receives a public source ID. Preserve the no-APIReader-List
+  rule; any additional live Get use requires its own correctness explanation and
+  approval.
+- Define a publication/copy policy for secrets and namespace-local dependencies,
+  including Secret, ConfigMap, service accounts, imagePullSecrets, existing PVCs,
+  and private image credentials. Copying names does not copy or authorize those
+  resources. Do not silently strip required fields and call the result equivalent.
+- Publication must not expose credentials embedded directly in the definition.
+  Image digest pinning and privileged/host resource restrictions also require
+  explicit policy; ordinary definition Ready is not publication approval.
+- For future 1:N builds, decide whether visibility is logical-template policy or
+  version-specific publication, and which concrete versions are eligible. Do not
+  implicitly expose new or pending builds merely because an earlier version was
+  public. Publish/unpublish mutation, discovery response models, source error
+  codes, and source provenance schema remain future design work.
+- Define the source-read/revocation race explicitly. The current design provides
+  no cross-object publication/copy barrier; revocation cannot be promised to drain
+  in-flight copies or retract definitions already copied.
+
+No production fields, reserved annotations, placeholder interfaces, feature
+flags, CRD changes, or SDK surface are introduced for this roadmap item now.
+Future validation should cover cross-team authorization, same-name sources,
+fresh destination IDs, independent pool options and ownership, private-by-default
+copies, source deletion/revocation isolation, dependency policies, and concurrent
+local name conflicts before enabling the extension.
+
 <a id="test-plan"></a>
 
 ## Test Plan
@@ -949,7 +1148,7 @@ Validate all input in team scope. Users cannot supply root metadata/system owner
 | Create/failure | Static 400 before Claim, Claim cleanup finalizer and allocation in the same Create, actual Claim UID version owner with no custom version finalizer, full version before 201 always Pending, bounded writes/creation grace, retained partial failure and 409 until explicit deletion |
 | CR compatibility | Four legacy BuildOptions fields plus WarmPool, schema/DeepCopy retention; custom legacy-field 400, old path still works |
 | Options/policies | true/0 defaults, null/absence, disabled explicit-zero rejection, empty autoscaler rejection, full capacity/cron, percentage/window bounds, size below min allowed/above max rejected |
-| Strict API input | Unknown fields, unsupported types/query parameters and invalid explicit nulls remain 400; allowed omitted/null options retain defaults; no widened root metadata or PVC input |
+| Strict API input | Unknown fields, unsupported types/query parameters and invalid explicit nulls remain 400; allowed omitted/null options retain defaults; restricted root metadata labels/annotations only, with no widened PVC input |
 | Definition state | Four native status fields/current generation, Unknown/Deleting projections, deterministic vs transient failures, no forced Building delay/runtime build |
 | Replica ownership | Fixed continuous size; auto initial size only; missing autoscaler does not reset replicas; pool recreation resets target UID samples/cooldowns |
 | Managed scaling | PA/pool actual SandboxTemplate controller-owner namespace/name/UID match and observed deletion; no Claim/version reads/watches or companion-name/templateRef/mode checks; optimistic-lock resourceVersion merge patches reject conflicts and same-name pool replacement |
@@ -960,9 +1159,10 @@ Validate all input in team scope. Users cannot supply root metadata/system owner
 | Cache/references | Per-cache ClaimOwner registration for Manager and Template/Claim controllers; Manager TemplateRef and existing SandboxSet TemplateRef registration; no VersionOwner cleanup index, no fail-open on missing index; unlabeled external pool still 409; original omitted kind/apiVersion defaults; inadequate scope/RBAC not served; no live List |
 | Controller reads | Stable positive Claim/version loops are cache-first with no 30-second steady poll; live reads only for negative Claim UID and known allocated-version confirmation; creation-grace/cleanup retries remain bounded |
 | Delete/recovery | Immediate DELETE, creator exit, controller restart; first delete only pinned Claim; Foreground version Delete with UID/resourceVersion Preconditions; concurrent sibling GC, no PA-to-pool ordering or acknowledgement annotation; native foregroundDeletion retains blocking inventory/Pod descendants, including after pool loss; Claim finalizer stays until versions confirmed absent |
-| Deletion completion | Cache-positive pinned Claim waits without repeated live reads; cache absence/UID change needs live confirmation before 204; incomplete or unconfirmable cleanup remains 503 |
+| Deletion completion | Cache-positive pinned Claim waits without repeated live reads; cache absence/UID change needs live confirmation before 204; a new DELETE whose live Claim read is NotFound returns 204 without starting cleanup or scanning descendants; incomplete or unconfirmable cleanup remains 503 |
 | Retries/concurrency | Internal retries pin UID; independent name retry may affect replacement; in-flight consumption may succeed/fail, delivered owners stay detached, new refs may break but external resources are not deleted |
 | Entrypoints | CLI default 0 disables custom listener; explicit repository deployment and SDK-derived default use 8081; new/legacy port isolation, scheme/TLS/host inheritance, old port/path replacement, IPv6, no global E2B_API_URL mutation; port collision and Service/external TLS reachability |
+| Metadata | Strict restricted maps and optional response; Claim/version persistence, internal marker retention/filtering; companion creation/recreation/repair without auto replica reset; root-only inventory/cold inheritance and delivery retention; external/legacy paths and Pod/PVC/Checkpoint/autoscaler unaffected; independent map copies |
 | PVC | name/spec materialization; labels/annotations/system metadata 400; native field and retention preservation |
 | Upgrade | Controlled operator migration of unreleased prototype custom version finalizers before upgrade; disabling listener does not perform cleanup; Claim/native foreground guarantees survive supported rollback/mixed versions |
 

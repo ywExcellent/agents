@@ -24,6 +24,7 @@ import (
 	"io"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	sigsjson "sigs.k8s.io/json"
 
 	api "github.com/openkruise/agents/api/v1alpha1"
@@ -43,10 +44,17 @@ type workloadInput struct {
 type optionsInput struct {
 	WarmPool *api.SandboxTemplateWarmPoolOptions `json:"warmPool,omitempty"`
 }
+
+// Only business maps are transport inputs; native ObjectMeta is not exposed.
+type metadataInput struct {
+	Labels      map[string]string `json:"labels,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
+}
 type createInput struct {
-	Name    string         `json:"name"`
-	Spec    *workloadInput `json:"spec"`
-	Options *optionsInput  `json:"options,omitempty"`
+	Metadata *metadataInput `json:"metadata,omitempty"`
+	Name     string         `json:"name"`
+	Spec     *workloadInput `json:"spec"`
+	Options  *optionsInput  `json:"options,omitempty"`
 }
 
 func decodeCreate(body io.Reader) (createInput, error) {
@@ -72,6 +80,31 @@ func decodeCreate(body io.Reader) (createInput, error) {
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &root); err != nil {
 		return in, err
+	}
+	// A null string is decoded as an empty Go string. Reject it explicitly,
+	// and reject null maps rather than silently losing declared metadata.
+	if value := root["metadata"]; len(value) > 0 && !bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+		var metadata map[string]json.RawMessage
+		if err := json.Unmarshal(value, &metadata); err != nil {
+			return in, err
+		}
+		for key, value := range metadata {
+			if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+				return in, fmt.Errorf("metadata.%s must be a string map", key)
+			}
+			var entries map[string]json.RawMessage
+			if err := json.Unmarshal(value, &entries); err != nil {
+				return in, err
+			}
+			for _, entry := range entries {
+				if bytes.Equal(bytes.TrimSpace(entry), []byte("null")) {
+					return in, fmt.Errorf("metadata values must be strings")
+				}
+			}
+		}
+		if errs := templateconfig.ValidateMetadata(templateconfig.Metadata{Labels: in.Metadata.Labels, Annotations: in.Metadata.Annotations}, field.NewPath("metadata")); len(errs) > 0 {
+			return in, errs.ToAggregate()
+		}
 	}
 	// Go decoding erases explicit null/zero presence. Inspect the wire declaration
 	// before defaults, especially disabled pools and integer scalar options.
@@ -157,6 +190,9 @@ func decodeCreate(body io.Reader) (createInput, error) {
 func (in createInput) definition() templateconfig.Definition {
 	s := in.Spec
 	d := templateconfig.Definition{Pod: s.PodSpec, VolumeClaimTemplates: s.VolumeClaimTemplates, PersistentContents: s.PersistentContents, Runtimes: s.Runtimes, PauseStrategy: s.PauseStrategy, Probes: s.Probes, AutoPausePolicy: s.AutoPausePolicy, Lifecycle: s.Lifecycle}
+	if in.Metadata != nil {
+		d.Metadata = templateconfig.Metadata{Labels: in.Metadata.Labels, Annotations: in.Metadata.Annotations}.Clone()
+	}
 	if in.Options != nil {
 		d.WarmPool = in.Options.WarmPool
 	}

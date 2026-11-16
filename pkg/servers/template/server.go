@@ -48,10 +48,11 @@ var (
 // secret reload and revocation are shared with the original listener.
 type Authorize func(context.Context, string) (string, error)
 type response struct {
-	Name       string  `json:"name"`
-	TemplateID *string `json:"templateId"`
-	Status     string  `json:"status"`
-	Message    string  `json:"message,omitempty"`
+	Metadata   *metadataInput `json:"metadata,omitempty"`
+	Name       string         `json:"name"`
+	TemplateID *string        `json:"templateId"`
+	Status     string         `json:"status"`
+	Message    string         `json:"message,omitempty"`
 }
 type errorResponse struct {
 	Code      int    `json:"code"`
@@ -99,6 +100,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 func (s *Server) Close() error { return s.http.Close() }
 func output(summary sandboxmanager.TemplateSummary) response {
 	result := response{Name: summary.Name, Status: summary.Status, Message: summary.Message}
+	metadata := templateconfig.UserMetadata(summary.Metadata.Labels, summary.Metadata.Annotations)
+	if len(metadata.Labels) > 0 || len(metadata.Annotations) > 0 {
+		result.Metadata = &metadataInput{Labels: metadata.Labels, Annotations: metadata.Annotations}
+	}
 	if summary.ID != "" {
 		id := summary.ID
 		result.TemplateID = &id

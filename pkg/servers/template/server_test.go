@@ -35,19 +35,21 @@ import (
 // These transport tests need only the four Manager operations, not a running
 // Sandbox runtime, Kubernetes cluster, quota backend, or authentication worker.
 type protocolTestService struct {
-	namespace string
-	calls     int
-	err       error
-	summary   sandboxmanager.TemplateSummary
+	namespace  string
+	calls      int
+	err        error
+	summary    sandboxmanager.TemplateSummary
+	definition templateconfig.Definition
 }
 
-func (s *protocolTestService) CreateTemplate(_ context.Context, ns, name string, _ templateconfig.Definition) (sandboxmanager.TemplateSummary, error) {
+func (s *protocolTestService) CreateTemplate(_ context.Context, ns, name string, d templateconfig.Definition) (sandboxmanager.TemplateSummary, error) {
 	s.namespace = ns
 	s.calls++
+	s.definition = d
 	if s.err != nil {
 		return sandboxmanager.TemplateSummary{}, s.err
 	}
-	return sandboxmanager.TemplateSummary{Name: name, ID: "a7f2k9m4p1q8r3s6t0v5", Status: "Pending"}, nil
+	return sandboxmanager.TemplateSummary{Name: name, ID: "a7f2k9m4p1q8r3s6t0v5", Status: "Pending", Metadata: d.Metadata.Clone()}, nil
 }
 func (s *protocolTestService) GetTemplate(_ context.Context, ns, _, _ string) (sandboxmanager.TemplateSummary, error) {
 	s.namespace = ns
@@ -154,6 +156,29 @@ func TestTemplateStrictInputPresence(t *testing.T) {
 		ok        bool
 	}{
 		{name: "minimal", raw: prefix + `}`, ok: true},
+		{name: "null root metadata", raw: prefix + `,"metadata":null}`, ok: true},
+		{name: "empty metadata", raw: prefix + `,"metadata":{}}`, ok: true},
+		{name: "business metadata", raw: prefix + `,"metadata":{"labels":{"app.kubernetes.io/name":"worker"},"annotations":{"description":"free text"}}}`, ok: true},
+		{name: "annotation budget boundary", raw: prefix + `,"metadata":{"annotations":{"x":"` + strings.Repeat("a", 64*1024-1) + `"}}}`, ok: true},
+		{name: "annotation budget exceeded", raw: prefix + `,"metadata":{"annotations":{"x":"` + strings.Repeat("a", 64*1024) + `"}}}`},
+		{name: "metadata name forbidden", raw: prefix + `,"metadata":{"name":"fake"}}`},
+		{name: "metadata namespace forbidden", raw: prefix + `,"metadata":{"namespace":"other"}}`},
+		{name: "metadata UID forbidden", raw: prefix + `,"metadata":{"uid":"fake"}}`},
+		{name: "metadata owner forbidden", raw: prefix + `,"metadata":{"ownerReferences":[]}}`},
+		{name: "metadata finalizers forbidden", raw: prefix + `,"metadata":{"finalizers":[]}}`},
+		{name: "metadata scalar", raw: prefix + `,"metadata":"fake"}`},
+		{name: "metadata array", raw: prefix + `,"metadata":[]}`},
+		{name: "metadata wrong case", raw: prefix + `,"metadata":{"Labels":{}}}`},
+		{name: "duplicate metadata map", raw: prefix + `,"metadata":{"labels":{},"labels":{}}}`},
+		{name: "duplicate metadata key", raw: prefix + `,"metadata":{"labels":{"app":"a","app":"b"}}}`},
+		{name: "metadata null map", raw: prefix + `,"metadata":{"annotations":null}}`},
+		{name: "metadata null value", raw: prefix + `,"metadata":{"labels":{"app":null}}}`},
+		{name: "metadata number value", raw: prefix + `,"metadata":{"labels":{"app":1}}}`},
+		{name: "metadata boolean value", raw: prefix + `,"metadata":{"annotations":{"app":true}}}`},
+		{name: "metadata invalid key", raw: prefix + `,"metadata":{"labels":{"bad key":"v"}}}`},
+		{name: "metadata invalid label value", raw: prefix + `,"metadata":{"labels":{"app":"free text"}}}`},
+		{name: "metadata reserved label", raw: prefix + `,"metadata":{"labels":{"agents.kruise.io/sandbox-id":"fake"}}}`},
+		{name: "metadata reserved annotation", raw: prefix + `,"metadata":{"annotations":{"sandbox.agents.kruise.io/hash-immutable-part":"fake"}}}`},
 		{name: "null options", raw: prefix + `,"options":null}`, ok: true},
 		{name: "default pool", raw: prefix + `,"options":{"warmPool":{}}}`, ok: true},
 		{name: "disabled", raw: prefix + `,"options":{"warmPool":{"enabled":false}}}`, ok: true},
@@ -226,5 +251,35 @@ func TestCustomTemplateListenerRootRoutingAndShutdown(t *testing.T) {
 		if response.StatusCode != test.code {
 			t.Fatalf("path=%s status=%d", test.path, response.StatusCode)
 		}
+	}
+}
+
+func TestTemplateMetadataHTTPProjection(t *testing.T) {
+	for _, method := range []string{"POST", "GET"} {
+		t.Run(method, func(t *testing.T) {
+			service := &protocolTestService{summary: sandboxmanager.TemplateSummary{Name: "demo", ID: "abcdefghijklmnopqrst", Status: "Ready", Metadata: templateconfig.Metadata{Labels: map[string]string{"project": "analysis", "agents.kruise.io/id": "secret"}, Annotations: map[string]string{"description": "worker", "agents.kruise.io/template-allocation": "secret"}}}}
+			path := "/templates/demo"
+			if method == "POST" {
+				path = "/templates"
+			}
+			request := httptest.NewRequest(method, path, strings.NewReader(`{"name":"demo","metadata":{"labels":{"project":"analysis"},"annotations":{"description":"worker"}},"spec":{"containers":[{"name":"main","image":"python:3.12"}]}}`))
+			request.Header.Set("X-API-Key", "team")
+			recorder := httptest.NewRecorder()
+			NewServer(":0", service, testAuthorize).ServeHTTP(recorder, request)
+			var result response
+			if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Metadata == nil || len(result.Metadata.Labels) != 1 || len(result.Metadata.Annotations) != 1 || result.Metadata.Labels["project"] != "analysis" || result.Metadata.Annotations["description"] != "worker" {
+				t.Fatalf("body=%s", recorder.Body.String())
+			}
+			if method == "POST" && (service.definition.Metadata.Labels["project"] != "analysis" || len(service.definition.TemplateSpec().Template.Labels) > 0) {
+				t.Fatal("root metadata missing or injected into PodTemplate")
+			}
+		})
+	}
+	result := output(sandboxmanager.TemplateSummary{Name: "empty", Status: "Unknown"})
+	if result.Metadata != nil {
+		t.Fatal("empty metadata must be omitted for old clients")
 	}
 }
