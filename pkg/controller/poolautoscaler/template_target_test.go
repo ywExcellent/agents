@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-	http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,15 +13,18 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package poolautoscaler
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -33,75 +36,119 @@ import (
 	api "github.com/openkruise/agents/api/v1alpha1"
 )
 
-func managedFixture() (*api.SandboxTemplateClaim, *api.SandboxTemplate, *api.PoolAutoscaler, *api.SandboxSet) {
-	c := &api.SandboxTemplateClaim{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "team", UID: "claim", Finalizers: []string{"test/hold"}}}
-	owner := func(kind, name string, uid types.UID) metav1.OwnerReference {
-		return metav1.OwnerReference{APIVersion: api.GroupVersion.String(), Kind: kind, Name: name, UID: uid, Controller: ptr.To(true)}
+func managedFixture() (*api.PoolAutoscaler, *api.SandboxSet) {
+	owner := metav1.OwnerReference{
+		APIVersion: api.GroupVersion.String(), Kind: "SandboxTemplate",
+		Name: "abcdefghijklmnopqrst", UID: "version", Controller: ptr.To(true),
 	}
-	v := &api.SandboxTemplate{ObjectMeta: metav1.ObjectMeta{Name: "abcdefghijklmnopqrst", Namespace: c.Namespace, UID: "version", Finalizers: []string{"test/hold"}, OwnerReferences: []metav1.OwnerReference{owner("SandboxTemplateClaim", c.Name, c.UID)}}, Spec: api.SandboxTemplateSpec{BuildOptions: &api.SandboxTemplateBuildOptions{WarmPool: &api.SandboxTemplateWarmPoolOptions{Enabled: ptr.To(true), Autoscaler: &api.SandboxTemplatePoolAutoscalerOptions{MinReplicas: 2, MaxReplicas: 10, CapacityPolicy: &api.CapacityPolicy{TargetAvailable: intstr.FromInt32(2)}}}}}}
-	pa := newPoolAutoscaler(v.Name, v.Namespace, v.Name, 10, &api.CapacityPolicy{TargetAvailable: intstr.FromInt32(2)})
+	// Resource names and template references need not match the controller owner.
+	pa := newPoolAutoscaler("autoscaler", "team", "pool", 10, &api.CapacityPolicy{TargetAvailable: intstr.FromInt32(2)})
 	pa.UID = "autoscaler"
 	pa.Spec.MinReplicas = 2
 	pa.Spec.ScaleTargetRef.APIVersion = api.GroupVersion.String()
-	pa.OwnerReferences = []metav1.OwnerReference{owner("SandboxTemplate", v.Name, v.UID)}
+	pa.OwnerReferences = []metav1.OwnerReference{owner}
 	pa.Finalizers = []string{"test/hold"}
-	p := newSandboxSet(v.Name, v.Namespace, 0, 0, 0)
+	p := newSandboxSet("pool", pa.Namespace, 0, 0, 0)
 	p.UID = "pool"
 	p.Finalizers = []string{"test/hold"}
-	p.OwnerReferences = []metav1.OwnerReference{owner("SandboxTemplate", v.Name, v.UID)}
-	p.Spec.TemplateRef = &api.SandboxTemplateRef{Name: v.Name, Kind: ptr.To("SandboxTemplate"), APIVersion: ptr.To(api.GroupVersion.String())}
-	return c, v, pa, p
+	p.OwnerReferences = []metav1.OwnerReference{owner}
+	return pa, p
 }
+
 func TestManagedAutoscalerStopsOnObservedDeletionOrOwnerMismatch(t *testing.T) {
-	for _, scenario := range []string{"active", "claim-delete", "version-delete", "pool-delete", "pa-delete", "claim-uid", "version-uid", "pool-owner", "target-name", "no-auto", "claim-missing"} {
-		t.Run(scenario, func(t *testing.T) {
-			c, v, pa, p := managedFixture()
-			now := metav1.Now()
-			switch scenario {
-			case "claim-delete":
-				c.DeletionTimestamp = &now
-			case "version-delete":
-				v.DeletionTimestamp = &now
-			case "pool-delete":
-				p.DeletionTimestamp = &now
-			case "pa-delete":
-				pa.DeletionTimestamp = &now
-			case "claim-uid":
-				c.UID = "new-claim"
-			case "version-uid":
-				v.UID = "new-version"
-			case "pool-owner":
-				p.OwnerReferences[0].UID = "foreign"
-			case "target-name":
-				pa.Spec.ScaleTargetRef.Kind = "Other"
-			case "no-auto":
-				v.Spec.BuildOptions.WarmPool.Autoscaler = nil
+	const ownerMismatch = "pool does not share the autoscaler's SandboxTemplate controller owner"
+	const deleting = "autoscaler or pool is deleting"
+	tests := []struct {
+		name            string
+		mutate          func(*api.PoolAutoscaler, *api.SandboxSet)
+		unmanaged       bool
+		inactiveMessage string
+	}{
+		{name: "same controller owner without template or claim objects"},
+		{name: "different owner namespace", mutate: func(_ *api.PoolAutoscaler, p *api.SandboxSet) { p.Namespace = "other" }, inactiveMessage: ownerMismatch},
+		{name: "different owner name", mutate: func(_ *api.PoolAutoscaler, p *api.SandboxSet) { p.OwnerReferences[0].Name = "other-version" }, inactiveMessage: ownerMismatch},
+		{name: "different actual owner UID", mutate: func(_ *api.PoolAutoscaler, p *api.SandboxSet) { p.OwnerReferences[0].UID = "replacement-version" }, inactiveMessage: ownerMismatch},
+		{name: "pool has no controller owner", mutate: func(_ *api.PoolAutoscaler, p *api.SandboxSet) { p.OwnerReferences = nil }, inactiveMessage: ownerMismatch},
+		{name: "pool owner is not controller", mutate: func(_ *api.PoolAutoscaler, p *api.SandboxSet) { p.OwnerReferences[0].Controller = ptr.To(false) }, inactiveMessage: ownerMismatch},
+		{name: "pool owner has different kind", mutate: func(_ *api.PoolAutoscaler, p *api.SandboxSet) { p.OwnerReferences[0].Kind = "SandboxTemplateClaim" }, inactiveMessage: ownerMismatch},
+		{name: "pool owner has different API version", mutate: func(_ *api.PoolAutoscaler, p *api.SandboxSet) { p.OwnerReferences[0].APIVersion = "other.example/v1" }, inactiveMessage: ownerMismatch},
+		{name: "pool owner has no actual UID", mutate: func(_ *api.PoolAutoscaler, p *api.SandboxSet) { p.OwnerReferences[0].UID = "" }, inactiveMessage: ownerMismatch},
+		{name: "managed pool deletion", mutate: func(_ *api.PoolAutoscaler, p *api.SandboxSet) { p.DeletionTimestamp = ptr.To(metav1.Now()) }, inactiveMessage: deleting},
+		{name: "managed autoscaler deletion", mutate: func(pa *api.PoolAutoscaler, _ *api.SandboxSet) { pa.DeletionTimestamp = ptr.To(metav1.Now()) }, inactiveMessage: deleting},
+		{name: "target and definition references are not managed checks", mutate: func(pa *api.PoolAutoscaler, p *api.SandboxSet) {
+			pa.Spec.ScaleTargetRef.Kind, pa.Spec.ScaleTargetRef.APIVersion = "Other", "other.example/v1"
+			p.Spec.TemplateRef = &api.SandboxTemplateRef{Name: "other-template"}
+		}},
+		{name: "unmanaged autoscaler can scale a template-owned pool", mutate: func(pa *api.PoolAutoscaler, _ *api.SandboxSet) { pa.OwnerReferences = nil }, unmanaged: true},
+		{name: "non-controller template owner is unmanaged", mutate: func(pa *api.PoolAutoscaler, p *api.SandboxSet) {
+			pa.OwnerReferences[0].Controller, p.OwnerReferences[0].UID = ptr.To(false), "foreign"
+		}, unmanaged: true},
+		{name: "different autoscaler controller kind is unmanaged", mutate: func(pa *api.PoolAutoscaler, _ *api.SandboxSet) { pa.OwnerReferences[0].Kind = "Other" }, unmanaged: true},
+		{name: "unmanaged pool deletion keeps existing scaling behavior", mutate: func(pa *api.PoolAutoscaler, p *api.SandboxSet) {
+			pa.OwnerReferences, p.DeletionTimestamp = nil, ptr.To(metav1.Now())
+		}, unmanaged: true},
+		{name: "unmanaged autoscaler deletion still stops at reconcile entry", mutate: func(pa *api.PoolAutoscaler, _ *api.SandboxSet) {
+			pa.OwnerReferences, pa.DeletionTimestamp = nil, ptr.To(metav1.Now())
+		}, unmanaged: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pa, p := managedFixture()
+			if tt.mutate != nil {
+				tt.mutate(pa, p)
 			}
-			objs := []client.Object{v, pa, p}
-			if scenario != "claim-missing" {
-				objs = append(objs, c)
+			managed, guardErr := checkManagedTarget(pa, p)
+			require.Equal(t, !tt.unmanaged, managed)
+			if tt.inactiveMessage != "" {
+				require.ErrorIs(t, guardErr, errInactiveManagedTarget)
+				require.EqualError(t, guardErr, errInactiveManagedTarget.Error()+": "+tt.inactiveMessage)
+			} else {
+				require.NoError(t, guardErr)
 			}
-			r := newTestReconciler(objs...)
-			if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(pa)}); err != nil {
-				t.Fatal(err)
+			// Reconcile itself resolves targets only within the autoscaler's namespace.
+			if p.Namespace != pa.Namespace {
+				return
 			}
+			r := newTestReconciler(pa, p)
+			key := client.ObjectKeyFromObject(pa)
+			r.getOrCreateMonitorFor(key, pa.UID, pa.Spec.ScaleTargetRef.Name, p.UID)
+			_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: key})
+			require.NoError(t, err)
 			got := &api.SandboxSet{}
-			if err := r.Get(t.Context(), client.ObjectKeyFromObject(p), got); err != nil {
-				t.Fatal(err)
+			require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(p), got))
+			want := int32(2)
+			if guardErr != nil || pa.DeletionTimestamp != nil {
+				want = 0
+				require.NotContains(t, r.monitors, key)
+			} else {
+				wantUID := p.UID
+				if tt.unmanaged {
+					wantUID = ""
+				}
+				require.Equal(t, wantUID, r.monitors[key].targetUID)
 			}
-			want := int32(0)
-			if scenario == "active" {
-				want = 2
-			}
-			if got.Spec.Replicas != want {
-				t.Fatalf("got %d want %d", got.Spec.Replicas, want)
+			require.Equal(t, want, got.Spec.Replicas)
+			gotPA := &api.PoolAutoscaler{}
+			require.NoError(t, r.Get(t.Context(), key, gotPA))
+			condition := apiMeta.FindStatusCondition(gotPA.Status.Conditions, string(api.PoolAutoscalerConditionScalingActive))
+			if pa.DeletionTimestamp != nil {
+				require.Nil(t, condition, "deleting autoscaler must stop before updating status")
+			} else if guardErr != nil {
+				require.NotNil(t, condition)
+				require.Equal(t, metav1.ConditionFalse, condition.Status)
+				require.Equal(t, "InactiveManagedTarget", condition.Reason)
+				require.Equal(t, guardErr.Error(), condition.Message)
+			} else {
+				require.NotNil(t, condition)
+				require.NotEqual(t, "InactiveManagedTarget", condition.Reason)
 			}
 		})
 	}
 }
+
 func TestManagedTargetMonitorResetsOnPoolUID(t *testing.T) {
-	c, v, pa, p := managedFixture()
-	r := newTestReconciler(c, v, pa, p)
+	pa, p := managedFixture()
+	r := newTestReconciler(pa, p)
 	key := client.ObjectKeyFromObject(pa)
 	old := r.getOrCreateMonitorFor(key, pa.UID, pa.Spec.ScaleTargetRef.Name, p.UID)
 	old.samples = []sample{{timestamp: time.Now(), available: 99, statusReplicas: 99}}
@@ -121,85 +168,91 @@ func TestManagedTargetMonitorResetsOnPoolUID(t *testing.T) {
 		t.Fatal("same target reset")
 	}
 }
-func TestManagedScaleRechecksCachedOwnership(t *testing.T) {
-	c, v, pa, p := managedFixture()
-	r := newTestReconciler(c, v, pa, p)
-	if err := r.Get(t.Context(), client.ObjectKeyFromObject(pa), pa); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Get(t.Context(), client.ObjectKeyFromObject(p), p); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Delete(t.Context(), c); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.scaleTarget(t.Context(), pa, p, 5, true); !errors.Is(err, errInactiveManagedTarget) {
-		t.Fatalf("expected stopped write: %v", err)
-	}
-	got := &api.SandboxSet{}
-	if err := r.Get(t.Context(), client.ObjectKeyFromObject(p), got); err != nil || got.Spec.Replicas != 0 {
-		t.Fatal("scaled after observed delete", err)
+
+func TestScaleTargetWritesObservedSnapshot(t *testing.T) {
+	for _, managed := range []bool{true, false} {
+		name := "managed"
+		if !managed {
+			name = "unmanaged"
+		}
+		t.Run(name, func(t *testing.T) {
+			pa, p := managedFixture()
+			r := newTestReconciler(pa, p)
+			base := r.Client.(client.WithWatch)
+			require.NoError(t, base.Get(t.Context(), client.ObjectKeyFromObject(p), p))
+			rv := p.ResourceVersion
+			writes := 0
+			r.Client = interceptor.NewClient(base, interceptor.Funcs{
+				Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+					t.Fatal("scaling must not reread cached objects")
+					return nil
+				},
+				Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+					writes++
+					data, err := patch.Data(obj)
+					require.NoError(t, err)
+					var fields map[string]map[string]any
+					require.NoError(t, json.Unmarshal(data, &fields))
+					require.Equal(t, types.MergePatchType, patch.Type())
+					require.Equal(t, map[string]any{"replicas": float64(5)}, fields["spec"])
+					if managed {
+						require.NotEmpty(t, rv)
+						require.Len(t, fields, 2)
+						require.Equal(t, map[string]any{"resourceVersion": rv}, fields["metadata"])
+					} else {
+						require.Len(t, fields, 1, "unmanaged patch must not gain a resourceVersion precondition")
+					}
+					return cl.Patch(ctx, obj, patch, opts...)
+				},
+			})
+			require.NoError(t, r.scaleTarget(t.Context(), p, 5, managed))
+			require.Equal(t, 1, writes)
+			got := &api.SandboxSet{}
+			require.NoError(t, base.Get(t.Context(), client.ObjectKeyFromObject(p), got))
+			require.Equal(t, p.UID, got.UID)
+			require.Equal(t, int32(5), got.Spec.Replicas)
+		})
 	}
 }
-func TestManagedScalePatchBindsUIDAndRVAndRejectsLateReplacement(t *testing.T) {
-	c, v, pa, p := managedFixture()
-	r := newTestReconciler(c, v, pa, p)
+
+func TestManagedScalePatchBindsRVAndRejectsLateReplacement(t *testing.T) {
+	pa, p := managedFixture()
+	r := newTestReconciler(pa, p)
 	base := r.Client.(client.WithWatch)
-	if err := base.Get(t.Context(), client.ObjectKeyFromObject(pa), pa); err != nil {
-		t.Fatal(err)
-	}
-	if err := base.Get(t.Context(), client.ObjectKeyFromObject(p), p); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, base.Get(t.Context(), client.ObjectKeyFromObject(p), p))
+	observed := p.DeepCopy()
 	r.Client = interceptor.NewClient(base, interceptor.Funcs{Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
 		data, err := patch.Data(obj)
-		if err != nil {
-			return err
-		}
-		var ops []map[string]any
-		if err := json.Unmarshal(data, &ops); err != nil {
-			return err
-		}
-		if patch.Type() != types.JSONPatchType || ops[0]["value"] != string(p.UID) || ops[1]["value"] != p.ResourceVersion {
-			t.Fatalf("patch=%s", data)
-		}
-		if err := cl.Delete(ctx, p); err != nil {
-			return err
-		}
-		// Simulate deletion completion followed by replacement after the cached read.
+		require.NoError(t, err)
+		var fields map[string]map[string]any
+		require.NoError(t, json.Unmarshal(data, &fields))
+		require.Equal(t, types.MergePatchType, patch.Type())
+		require.NotEmpty(t, observed.ResourceVersion)
+		require.Equal(t, map[string]map[string]any{
+			"metadata": {"resourceVersion": observed.ResourceVersion},
+			"spec":     {"replicas": float64(5)},
+		}, fields)
+		require.NoError(t, cl.Delete(ctx, observed))
+		// Simulate deletion completion followed by replacement after observation.
 		old := &api.SandboxSet{}
-		if err := cl.Get(ctx, client.ObjectKeyFromObject(p), old); err != nil {
-			return err
-		}
+		require.NoError(t, cl.Get(ctx, client.ObjectKeyFromObject(observed), old))
 		old.Finalizers = nil
-		if err := cl.Update(ctx, old); err != nil {
-			return err
-		}
-		replacement := p.DeepCopy()
+		require.NoError(t, cl.Update(ctx, old))
+		replacement := observed.DeepCopy()
 		replacement.UID = "replacement"
 		replacement.ResourceVersion = ""
 		replacement.Finalizers = nil
 		replacement.DeletionTimestamp = nil
-		if err := cl.Create(ctx, replacement); err != nil {
-			return err
-		}
+		require.NoError(t, cl.Create(ctx, replacement))
+		// API-server resourceVersions are distinct across same-name pool lifecycles.
+		require.NotEmpty(t, replacement.ResourceVersion)
+		require.NotEqual(t, observed.ResourceVersion, replacement.ResourceVersion)
 		return cl.Patch(ctx, obj, patch, opts...)
 	}})
-	if err := r.scaleTarget(t.Context(), pa, p, 5, true); err == nil {
-		t.Fatal("late replacement accepted stale patch")
-	}
+	err := r.scaleTarget(t.Context(), p, 5, true)
+	require.True(t, apierrors.IsConflict(err), "late replacement must reject the stale patch with a conflict: %v", err)
 	got := &api.SandboxSet{}
-	if err := base.Get(t.Context(), client.ObjectKeyFromObject(p), got); err != nil || got.UID != "replacement" || got.Spec.Replicas != 0 {
-		t.Fatal("replacement changed", err)
-	}
-}
-func TestManagedOwnerEventsWakeAutoscaler(t *testing.T) {
-	c, v, pa, p := managedFixture()
-	r := newTestReconciler(c, v, pa, p)
-	if got := r.templateToPoolAutoscaler(t.Context(), v); len(got) != 1 || got[0].NamespacedName != client.ObjectKeyFromObject(pa) {
-		t.Fatalf("template events=%v", got)
-	}
-	if got := r.claimToPoolAutoscaler(t.Context(), c); len(got) != 1 || got[0].NamespacedName != client.ObjectKeyFromObject(pa) {
-		t.Fatalf("claim events=%v", got)
-	}
+	require.NoError(t, base.Get(t.Context(), client.ObjectKeyFromObject(observed), got))
+	require.Equal(t, types.UID("replacement"), got.UID)
+	require.Equal(t, observed.Spec.Replicas, got.Spec.Replicas, "replacement must remain unchanged")
 }

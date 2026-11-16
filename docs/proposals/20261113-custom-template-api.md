@@ -3,7 +3,7 @@ title: Custom Template API and Companion Warm Pools
 authors: []
 reviewers: []
 creation-date: 2026-11-13
-last-updated: 2026-11-14
+last-updated: 2026-11-16
 status: provisional
 see-also:
   - 20260916-sandbox-template-build-and-e2b-compatibility.md
@@ -12,9 +12,7 @@ see-also:
 
 # Custom Template API and Companion Warm Pools
 
-> **Proposal; the complete first release is not released.** Local P0-P7 work now includes the resource types, neutral rules, independent control cache, Manager/custom HTTP API, definition controllers, fixed pools, durable deletion, companion autoscalers and managed target-UID guards, plus the additive Python SDK in agents-api. Deployment/Service/TLS exposure and live cluster/fault acceptance remain P8 work. Authors and reviewers will be assigned during review; local implementation does not imply release or complete production acceptance.
->
-> This is an additive custom API, not a rewrite of the existing E2B Template proposal. Checkpoint builds, command DSLs, additional backends, and the earlier identity model are outside this release. The contracts below are self-contained; implementation plans, Chinese review material, and readiness logs are maintained separately from this repository's proposal.
+This proposal defines an additive custom API, not a rewrite of the existing E2B Template proposal. Checkpoint builds, command DSLs, additional backends, and the earlier identity model are outside this release.
 
 ## Table of Contents
 
@@ -33,10 +31,8 @@ see-also:
   - [Read Consistency and Control Cache](#consistency)
 - [Implementation Details](#implementation)
 - [Security, Risks, and Mitigations](#risks)
-- [Alternatives](#alternatives)
 - [Upgrade Strategy](#upgrade)
 - [Test Plan](#test-plan)
-- [Implementation History](#history)
 - [References](#references)
 
 <a id="glossary"></a>
@@ -63,7 +59,7 @@ Add an independent custom Template management API to OpenKruise Agents. Users su
 
 Separate logical names from concrete versions. A minimal `SandboxTemplateClaim` provides name uniqueness and the logical deletion boundary; the existing `SandboxTemplate` stores the complete version. Management uses name, while Sandbox creation uses a concrete templateId. The first release supports one build per Claim, but the resource relationship leaves room for future one-to-many versions without exposing `/builds`, tags, or aliases now.
 
-The new listener defaults to port 8081; existing E2B and Sandbox endpoints remain unchanged. POST returns a `Pending` acceptance snapshot. SDK waiting polls a GET bound to the returned version ID. Ready covers definition validation only; companion reconciliation is asynchronous. DELETE removes the logical template by name and waits for durable, ordered cleanup. It does not introduce a consumption barrier, a conditional-delete token, or a global drain guarantee.
+The new listener is opt-in: `--custom-template-port` defaults to 0 (disabled), while the repository deployment explicitly passes 8081 and the SDK derives port 8081 by default. Existing E2B and Sandbox endpoints remain unchanged. POST returns a `Pending` acceptance snapshot. SDK waiting polls a GET bound to the returned version ID. Ready covers definition validation only; companion reconciliation is asynchronous. DELETE removes the logical template by name and waits for Claim-protected native foreground cleanup. It does not impose sibling cleanup ordering or introduce a consumption barrier, a conditional-delete token, or a global drain guarantee.
 
 <a id="motivation"></a>
 
@@ -87,7 +83,7 @@ Existing SandboxSets can reference SandboxTemplates, which is useful for current
 - Declare companion SandboxSet and PoolAutoscaler through build options without exposing resource names, target refs, or system metadata.
 - Preserve the existing Sandbox entrypoint and use templateId to locate its companion pool; delivered Sandboxes have inline definitions.
 - Make companion inventory, cold creation, and revision/hash resolution use the same full effective configuration without changing non-companion inheritance.
-- Provide synchronous deletion backed by persistent finalizers and an explicit cleanup sequence.
+- Provide synchronous deletion backed by a persistent Claim cleanup finalizer and native foreground deletion of owned versions.
 - Define negative-read confirmation, an independent complete control cache, and Kubernetes read discipline.
 
 ### Non-Goals / Future Work
@@ -136,7 +132,7 @@ flowchart TB
         LEGACY_TEMPLATES["Legacy E2B Template routes<br/>GET /templates and /templates/{templateID}<br/>DELETE within existing support"]
         LEGACY_SANDBOX["Existing Sandbox routes<br/>POST /sandboxes or /v2/sandboxes<br/>Existing instance operations"]
     end
-    subgraph CUSTOM_PORT["New custom listener - default 8081"]
+    subgraph CUSTOM_PORT["Opt-in custom listener - --custom-template-port=8081<br/>CLI default 0: disabled"]
         CUSTOM_API["Custom Template contract<br/>POST /templates<br/>GET /templates and /templates/{name}<br/>DELETE /templates/{name}"]
     end
     BACKEND["Shared Manager / Infra and Kubernetes capabilities<br/>Different template protocols and resource views<br/>Custom declarations include pools and autoscalers"]
@@ -152,7 +148,7 @@ flowchart TB
     LEGACY_SANDBOX --> BACKEND
 ```
 
-- Custom template management and waiting use the new listener, default 8081. Sandbox creation, claiming, and instance operations keep their existing entrypoint.
+- Custom template management and waiting use the opt-in listener. The CLI defaults `--custom-template-port` to 0 (disabled); the repository deployment explicitly passes 8081, matching the SDK's default derived port. Sandbox creation, claiming, and instance operations keep their existing entrypoint.
 - Legacy `/templates` retains its contract, rather than becoming a Claim API. The two protocols may observe related underlying pool resources; port isolation is not backend data isolation.
 - Internally derive the new origin from the existing final E2B API address: preserve scheme, hostname, TLS, authentication, and transport configuration; replace any port with 8081; clear base path, query, and fragment. Send Template requests to root `/templates`.
 - Removing `/kruise/api` applies only to new Template URL derivation. It does not delete legacy routes, mutate global `E2B_API_URL`, or change Sandbox proxy traffic.
@@ -228,8 +224,8 @@ flowchart TB
     end
     USER_NAME -->|"Management always uses name"| CLAIM
     CLAIM -->|"Controller ownerReference: claimUID<br/>Currently 0/1 version, future 1:N"| VERSION
-    VERSION -->|"Controller ownerReference: versionUID<br/>Declared by warmPool.enabled"| POOL
-    VERSION -->|"Controller ownerReference: versionUID<br/>Declared by warmPool.autoscaler"| AUTOSCALER
+    VERSION -->|"Blocking controller ownerReference: versionUID<br/>Declared by warmPool.enabled"| POOL
+    VERSION -->|"Blocking controller ownerReference: versionUID<br/>Declared by warmPool.autoscaler"| AUTOSCALER
     AUTOSCALER -.->|"scaleTargetRef; writes replicas in auto mode"| POOL
     POOL -->|"Existing inventory controller owner"| STOCK
     VERSION -.->|"Non-controller blocking owner before delivery<br/>Foreground GC completion guard"| STOCK
@@ -281,7 +277,7 @@ type SandboxTemplateClaimList struct {
 
 Claim contains standard metadata only. Atomic name reservation, owner relationships, and deletion protection use native Kubernetes mechanisms. Do not add TemplateIdentity, DisplayName, or dedicated timestamp fields.
 
-**Internal creation metadata:** POST writes `agents.kruise.io/template-allocation` with the one allocated child key in the same Claim Create. This is a cleanup ledger used to confirm a known version key when an owned-version cache list is empty; it is not a default-version ref, alias, or public selection field. A positive `agents.kruise.io/template-creation-complete` marker may be published after the full version Create succeeds. Neither annotation is user-configurable, returned by GET/LIST, or used to reconstruct a lost definition. Claim still has no spec/status or dedicated timestamp fields.
+**Internal creation metadata:** POST installs the Claim cleanup finalizer and writes `agents.kruise.io/template-allocation` with the one allocated child key in the same Claim Create. This is a cleanup ledger used to confirm a known version key when an owned-version cache list is empty; it is not a default-version ref, alias, or public selection field. A positive `agents.kruise.io/template-creation-complete` marker may be published after the full version Create succeeds. Neither annotation is user-configurable, returned by GET/LIST, or used to reconstruct a lost definition. Claim still has no spec/status or dedicated timestamp fields. Concrete versions have no custom template cleanup finalizer; native foreground deletion provides their cleanup barrier.
 
 #### Complete Version Top-Level Types
 
@@ -654,13 +650,13 @@ Creation validation errors are 400; partial persistence errors map to 503/500 as
 Authenticate and resolve team scope
   -> Validate/default the complete input, static definition, and policies
   -> Allocate templateId once
-  -> Create Claim, atomically reserving name with its cleanup finalizer
-  -> Create full version with its finalizer and actual Claim UID owner
+  -> Create Claim, atomically reserving name with its cleanup finalizer and allocation annotation
+  -> Create full version with actual Claim UID owner, without a custom version cleanup finalizer
   -> Return 201 Pending after both objects are persisted
   -> Controller revalidates definition and reconciles companions asynchronously
 ```
 
-- Install finalizers in the same Create operations, not asynchronously after unprotected objects exist. Test immediate DELETE and creator-process exit windows.
+- Install the Claim cleanup finalizer and allocation annotation in its Create, not asynchronously after an unprotected Claim exists. The version is owned by that actual Claim UID and uses native foreground cleanup when deleted. Test immediate DELETE and creator-process exit windows.
 - POST waits for neither definition Ready nor pools/autoscalers/stock. name/templateId come from these persisted results. Status is always Pending; do not add a re-read merely to reflect concurrently finished validation.
 - Any partial failure retains created resources and returns an error. There is no automatic rollback, empty-Claim repair, ID reallocation, or public retry.
 - A same-name POST remains 409 until cleanup. API-server atomic Create guarantees uniqueness; local locks or cache pre-checks do not.
@@ -735,7 +731,7 @@ SDK wait_until_ready binds handle.id and repeatedly calls the specified-version 
 
 After definition validation passes, and while neither Claim nor version is deleting, reconcile the persisted declaration into zero/one pool and zero/one autoscaler:
 
-- Both have the version's namespace/name and a controller ownerReference to its actual UID.
+- Both have the version's namespace/name and a controller ownerReference to its actual UID with `blockOwnerDeletion=true`, so native foreground GC retains the version while its blocking companions remain.
 - PoolAutoscaler is owned by the version, **not the pool**; pool recreation may preserve the policy resource and reestablish target observations.
 - The system fills scaleTargetRef with the companion SandboxSet name/kind/apiVersion.
 - Same name is not proof of ownership. Do not adopt/overwrite/delete external same-name objects. Preserve existing one-autoscaler-per-pool conflict rules.
@@ -747,7 +743,7 @@ After definition validation passes, and while neither Claim nor version is delet
 
 Mode depends on the **persisted declaration**, not whether the autoscaler CR currently exists. Failed creation, temporary loss, or pending repair must not switch an existing pool back to fixed mode or reset its replicas to size. Only new/recreated pools use initial size.
 
-Before scaling, a managed autoscaler verifies that the target pool belongs to the same actual version UID. It must not write replicas to a same-name external pool. Reset old target observations/samples when pool UID changes. Scope this protection to the managed relationship; do not change general external-autoscaler algorithms or public contracts.
+Before scaling, a managed autoscaler compares its own and the target pool's actual `SandboxTemplate` controller-owner references: namespace, owner name, and owner UID must match, and neither the autoscaler nor the pool may have observed deletion. It must not write replicas to a same-name external pool. Scaling performs no Claim/version reads or watches and no additional companion-name, templateRef, or persisted-mode checks. Reset old target observations/samples when pool UID changes. Replica writes use an optimistic-lock merge patch carrying the observed pool resourceVersion as the identity/concurrency safeguard; do not replace conflicts with unconditional writes. These cache observations do not drain already-submitted updates. Scope this protection to the managed relationship; retain existing unmanaged algorithms and public contracts.
 
 **Permanent-name-collision behavior:** An external same-name pool/autoscaler may prevent companion creation after the version was saved. Definition can remain Ready. Do not reallocate templateId or add public child status. Emit a Kubernetes Event on the owned version and controller logs; already-created owned children may use existing Conditions. Reconciliation may recover when the conflict is removed. Until then, consumption follows existing missing-pool/stock behavior. Do not direct users only to Conditions on a child that was never created.
 
@@ -761,7 +757,7 @@ Use **actual-owner-scoped complete inheritance**, not inline policy duplication 
 2. For a genuine companion, deep-copy the entire PodTemplate, PVC templates, persistentContents, runtimes, pauseStrategy, probes, autoPausePolicy, and lifecycle from the version. Do not include buildOptions/backend/status in the instance definition or workload hash.
 3. Non-companion behavior stays unchanged: inline template wins; templateRef supplies PodTemplate only; other policies and PVCs still come from SandboxSet. Do not introduce per-field fallback/merging.
 4. A declared managed owner with wrong ref/UID, missing owner version, or simultaneous inline template is an association error. Do not downgrade silently or adopt an external resource.
-5. Inventory materialization, no-stock cold creation, and revision/hash use one neutral effective-configuration resolver. Do not inherit correctly on create while hashing the empty pool fields.
+5. Inventory materialization, no-stock cold creation, and revision/hash share `pkg/templateconfig.ResolveTemplateSpec`. Actual companions use the entire version definition; the non-companion projection must contain every pool policy copied to Sandboxes or hashed for revisions. Do not inherit correctly on create while hashing the empty pool fields, or omit a non-companion policy from only one consumer.
 
 Add no Template Ready/autoscaler admission check and no direct cold creation from Template when the pool is absent. Preserve existing no-template/no-pool/no-stock branching, waiting/errors, and CreateOnNoStock behavior. Delivered Sandboxes have inline definitions and no direct templateRef; they are outside template inventory cleanup. Claiming existing stock does not overwrite its definition again. The existing delivery modifier removes all ownerReferences. Before delivery, genuine-companion inventory also carries a blocking, non-controller ownerReference to its concrete version, in addition to the existing pool controller owner. This supplies a durable GC completion guard after pool loss; it does not change non-companion workload/hash semantics or attach already-delivered instances to template cleanup.
 
@@ -769,30 +765,30 @@ Add no Template Ready/autoscaler admission check and no direct cold creation fro
 
 ### Synchronous Deletion and Concurrency
 
-#### Reference Check and Cleanup Order
+#### Reference Check and Foreground Cleanup
 
 Authenticate, resolve the current team-scoped Claim with a real keyed Get, and pin its UID. Inspect external SandboxSet references to its owned versions. Observed non-companion references return 409 **before any destructive cleanup**; genuine companion refs do not block deletion.
 
 ```text
 Pin Claim UID and finish the pre-deletion reference check
   -> First DELETE only that Claim, with UID precondition
-  -> Claim finalizer retains the parent and logical name
+  -> Claim cleanup finalizer retains the parent and logical name
   -> Controller observes deletion and stops new companion creation/repair
-  -> Advance version cleanup; stop/delete owned PoolAutoscalers
-  -> Delete owned SandboxSets and undelivered inventory/Pods
-  -> Follow existing PVC retention/deletion policy; confirm required cleanup
-  -> Delete versions and release version finalizers
-  -> Release Claim finalizer only after all owned versions finish
-  -> API confirms pinned object and required related cleanup, then returns 204
+  -> DELETE owned versions with Foreground propagation and UID/resourceVersion Preconditions
+  -> Native foregroundDeletion retains versions while blocking descendants are cleaned
+  -> GC handles sibling PoolAutoscalers and SandboxSets concurrently, without imposed ordering
+  -> Undelivered inventory/Pods complete normal cleanup; existing PVC retention policy applies
+  -> Release Claim finalizer only after all owned versions are confirmed absent
+  -> API confirms pinned Claim absence or UID change, then returns 204
 ```
 
-Accepting parent deletion sets deletionTimestamp; it does not mean immediate storage removal. Claim and version initially use background deletion with their custom finalizers intact, keeping solid owner objects while the controller explicitly cleans owned autoscalers and pools in order. It checks observed owner-index candidates and the declared child key; negative observations of known owned targets require a keyed live confirmation. UID/resourceVersion preconditions protect observed child identity and ownership without a global write barrier.
+Accepting parent deletion sets deletionTimestamp; it does not mean immediate storage removal. The Claim cleanup finalizer protects the parent while the controller requests native foreground deletion of versions using the observed UID and resourceVersion Preconditions. Concrete versions have no custom template cleanup finalizer and need no cleanup-foreground acknowledgement annotation. The controller discovers versions through the Claim-owner index and confirms the known allocated version key when the cache has not observed it; it does not use a version-owner cleanup index over pools/autoscalers or explicitly delete those siblings in sequence.
 
-After autoscalers and pools are gone, the controller requests foreground deletion of the still-protected version, then releases its custom cleanup finalizer. A UID-bound, partial system-annotation merge acknowledges that the foreground Delete was accepted. This survives a restart and avoids repeatedly re-arming GC when zero-stock foreground GC has already removed its own finalizer. The version's standard `foregroundDeletion` finalizer remains the durable barrier for blocking, non-controller-owned inventory and its Pod/PVC descendants, including inventory no longer controlled by a lost pool. Claim is released only after the version is confirmed absent. Pool GC alone is not the complete inventory proof when inventory also has this version owner; sibling GC alone does not establish ordering. Delivered instances whose owners were detached before deletion are outside this chain; no in-flight delivery drain is promised.
+The version's native `foregroundDeletion` finalizer is the durable cleanup barrier. Companion pools/autoscalers have blocking controller-owner references to the version; undelivered companion Sandboxes also have a blocking non-controller version owner. Foreground GC retains the version until these blocking resources and their required inventory/Pod descendants complete normal deletion, including inventory no longer controlled by a lost pool. Existing PVC retention/deletion policy remains authoritative; retained/shared PVCs are not force-deleted. GC handles autoscalers and pools concurrently, not in a PA-to-pool cleanup order. The Claim finalizer remains until the version is confirmed absent. Delivered instances whose owners were detached before deletion are outside this chain; no in-flight delivery drain is promised.
 
 204 does not wait for global image-cache GC, remove delivered Sandboxes/external resources, or force-delete shared/Retain PVCs. Incomplete/unconfirmable cleanup or wait timeout returns 503. A 500 does not restore removed objects. HTTP timeout, request exit, or process restart does not cancel durable cleanup. Progress cannot exist only in Manager memory/request snapshots.
 
-A cache NotFound for Claim cannot directly yield 204. Even confirmed parent absence needs synchronous-finalizer and normal-cleanup evidence; neither a single empty cached list nor parent NotFound alone proves descendants are gone. Manual finalizer removal or forced deletion outside normal cleanup is outside this guarantee. Do not equate pool deletionTimestamp with completed inventory/Pod/PVC cleanup.
+During the synchronous wait, a positive cache observation of the pinned Claim means cleanup is incomplete; do not repeatedly replace it with live reads. Cache absence or a changed UID requires a keyed live confirmation before returning 204. A replacement Claim is not part of the pinned deletion request and must not be deleted by its internal retries. Completion relies on the normal Claim-finalizer/native-foreground chain, including confirmation of the known allocated version, rather than an empty cached list or parent NotFound alone. Manual finalizer removal or forced deletion outside normal cleanup is outside this guarantee. Do not equate pool deletionTimestamp with completed inventory/Pod/PVC cleanup.
 
 #### name DELETE Retry Boundary
 
@@ -813,26 +809,28 @@ This release adds neither If-Match/delete token nor public Claim UID, so it does
 
 #### Current Identity and Confirmed Absence
 
-- Single GET/DELETE use a namespace/name keyed real Get to confirm current Claim UID/deletion state, preventing stale replica caches from attaching to a same-name old Claim.
-- For a missing or suspiciously misowned specified version in cache, confirm using a keyed namespace/templateId real Get. Only confirmed absence/nonmembership of the current Claim maps to 404.
-- Default selection and LIST remain eventually consistent control-cache views. They may temporarily return Unknown or omit new entries; do not fall back to latest Ready.
-- Read failures map to 503/appropriate internal errors, not 404, Unknown, empty list, or deletion success. Negative reads of known cleanup targets require necessary keyed confirmation too.
+- Single GET/DELETE use a namespace/name keyed live Get to confirm current Claim UID/deletion state, preventing stale replica caches from attaching to a same-name old Claim.
+- For a missing or suspiciously misowned specified version in cache, confirm using a keyed namespace/templateId live Get. Only confirmed absence/nonmembership of the current Claim maps to 404.
+- Default version selection and LIST remain eventually consistent control-cache views. They may temporarily return Unknown or omit new entries; do not fall back to latest Ready. Single GET still confirms its current Claim identity live.
+- During deletion waiting, positive observations of the pinned Claim remain cache-first; only cache absence or UID change triggers live confirmation of completion.
+- Read failures map to 503/appropriate internal errors, not 404, Unknown, empty list, or deletion success. A cache-negative known allocated version needs a keyed live confirmation before releasing the Claim.
 
 Do not assume all later 404s are real after a first successful GET. Waiting for the creator replica's local cache does not synchronize all replicas.
 
-These are bounded Infra correctness capabilities, not API-to-Infra shortcuts. Repository rules prohibit APIReader.List. **Approved on November 13, 2026:** keyed current-Claim UID/deletion-state confirmation; specified-version cache-negative/ownership confirmation; and negative confirmation of known cleanup targets. The concrete Get-only reader interfaces cannot List. Positive cleanup cache observations are used conservatively; real reads confirm absence of the known owned target rather than replacing all informer reads. This authorizes implementation of these uses, not inspection of personal kubeconfig, cluster execution, or E2E tests. Local tests use in-process clients only.
+These are bounded Infra correctness capabilities, not API-to-Infra shortcuts. Repository rules prohibit APIReader.List; concrete Get-only reader interfaces cannot List. Live Gets are limited to current-Claim identity for single API requests, specified-version negative/ownership confirmation, and necessary deletion-completion confirmation. Positive cleanup cache observations are used conservatively rather than replaced with repeated live reads.
+
+Template/Claim controller steady-state reconciliation is cache-first and event-driven, with no 30-second steady polling loop. It confirms a cache-negative or UID-mismatched Claim live before treating a version as orphaned, and confirms the known allocated version key when a cache-negative observation could prematurely release the Claim. Stable positive Claim/version observations do not trigger live reads; bounded creation-grace or incomplete-cleanup retries are distinct from steady-state polling.
 
 #### Complete Control View and Indexes
 
-The manager's independent Template control cache covers supported team namespaces and Claims, versions, and SandboxSet references, without inheriting the legacy consumption SandboxLabelSelector and without watching PoolAutoscalers. Companion PoolAutoscaler discovery and cleanup run in the template controller, whose own cache registers the version-owner index over SandboxSets and PoolAutoscalers. Do not remove legacy consumption filtering. External pools without matching business labels must still block deletion.
+The Manager's independent Template control cache covers supported team namespaces and Claims, versions, and SandboxSet references, without inheriting the legacy consumption SandboxLabelSelector and without watching PoolAutoscalers. The Template/Claim controller registers only the Claim-owner version index for its cleanup needs; native foreground GC cleans blocking companions, so no pool/autoscaler version-owner cleanup index is needed. Companion reconciliation uses declared child keys and actual ownership. Do not remove legacy consumption filtering. External pools without matching business labels must still block deletion.
 
 | Index | Registered by | Purpose |
 | --- | --- | --- |
-| Version Claim-owner UID | Manager control view | Versions of the current Claim; recheck owner kind/UID after retrieval |
-| SandboxSet.spec.templateRef.name | Manager control view | Namespace + version-name reference lookup; mirror the existing typed-by-name lookup and check actual owner identity to distinguish companions |
-| Pool/autoscaler version-owner UID | Template controller cache | Owned companion discovery/cleanup |
+| Version Claim-owner UID (ClaimOwner) | Manager control view and Template/Claim controller cache, independently | Versions of the current Claim and Claim cleanup; recheck owner kind/UID after retrieval |
+| SandboxSet.spec.templateRef.name (TemplateRef) | Manager control view and existing SandboxSet controller cache, independently | Namespace + version-name reference lookup; preserve existing controller registration and check actual owner identity to distinguish companions |
 
-The poolautoscaler controller keeps its own pre-existing scaleTargetRef index for event wiring; it is not part of this API's control view.
+The PoolAutoscaler controller keeps its own pre-existing scaleTargetRef index for event wiring; it is not part of this API's control view. Managed scaling adds no Claim/version watches.
 
 Existing SandboxSet materialization/revision paths resolve SandboxTemplate by `templateRef.name` and currently ignore GVK hints. Therefore external-reference checks conservatively include every matching name, even if the ref contains stale PodTemplate/v1 hints. Genuine-companion inheritance still requires the explicit SandboxTemplate GVK and actual owner UID.
 
@@ -853,10 +851,12 @@ The complete management view does not guarantee legacy consumption visibility: a
 | API, pkg/servers | Listener/router, DTOs, authentication/authorization, protocol validation, HTTP/error mapping; no Manager bypass |
 | Manager | Create orchestration, one-time ID allocation, logical selection, reference checks, pinned deletion trigger and synchronous wait |
 | Infra | Kubernetes clients/control cache/bounded reads, persisted operations, completion observation, identity safeguards; no HTTP/API-key semantics |
-| Independent Template/Claim controllers | Definition revalidation, fixed capacity, companion intent, finalizer cleanup; no dynamic-replica overwrites |
+| Independent Template/Claim controllers | Definition revalidation, fixed capacity, companion intent, foreground version deletion and Claim finalizer release after confirmed absence; no dynamic-replica overwrites |
 | PoolAutoscaler controller | Existing algorithm/status, managed target UID protection, target-recreation observation reset, stop new writes on deletion |
 | SandboxSet/Sandbox controllers and GC | Existing inventory/runtime lifecycle, effective materialization, controlled stock/PVC cleanup |
 | Neutral shared modules | Responsibility-specific static validation, effective configuration, and index extraction; no hidden reverse dependencies |
+
+The Manager/Infra contract retains the neutral `pkg/templateconfig.Definition` interface. Concrete Sandbox CR Infra converts that definition to/from `SandboxTemplateSpec` internally; CR specs, Kubernetes clients, and cache objects do not cross the Manager/Infra boundary. API request models and protocol validation remain in the API layer.
 
 Entrypoints only assemble/start dependencies. New and legacy listeners share the Manager, authentication/key storage, and quota runtime rather than starting duplicate business control planes. Secret-config reloads must still reach their owning configreload components; do not keep a static second key snapshot. Anonymous admin in legacy no-auth mode is not an implicit team for the new API.
 
@@ -865,12 +865,12 @@ Controller dependency closures must not import pkg/servers or pkg/sandbox-manage
 ### Delivery Steps
 
 1. Add Claim registration/CRD/RBAC and additive WarmPool generated artifacts; preserve existing schema/DeepCopy fields.
-2. Establish the independent control cache, indexes, bounded approved Get capabilities, coverage/RBAC/readiness checks.
-3. Share neutral validation/defaulting and owner-scoped effective resolution across API revalidation, inventory/cold creation, and revision.
-4. Add listener/DTO/Manager orchestration without changing old routes: synchronous finalizers/full version in POST, minimal GET projection.
-5. Implement managed companion reconciliation, fixed/auto replica ownership, target UID protection, and pool/autoscaler loss recovery.
-6. Implement durable Claim/version cleanup, external-reference prechecks, actual completion evidence, and synchronous DELETE.
-7. Implement SDK-internal URL derivation and version-bound wait, Service/TLS exposure, and acceptance tests.
+2. Establish the independent control cache, per-cache ClaimOwner/TemplateRef registrations, narrowly scoped live Get capabilities, and coverage/RBAC/readiness checks.
+3. Share neutral validation/defaulting and `ResolveTemplateSpec` across API revalidation, inventory/cold creation, and revision, retaining the neutral Definition boundary.
+4. Add opt-in listener/DTO/Manager orchestration without changing old routes: atomic Claim finalizer/allocation and full owned version in POST, minimal GET projection.
+5. Implement managed companion reconciliation, fixed/auto replica ownership, PA/pool owner checks, optimistic-lock replica writes, and pool/autoscaler loss recovery.
+6. Implement Claim-protected native foreground version cleanup, external-reference prechecks, cache-first completion with live negative confirmation, and synchronous DELETE.
+7. Implement SDK-internal URL derivation and version-bound wait, explicit Service/TLS exposure, and acceptance tests.
 
 These are delivery slices, not a promise that any partial batch can fulfill the public contract alone. Before exposure, verify cross-replica reads, immediate deletion, process exit, common inheritance/hash source, and collisions. Existing source interfaces or generated CRDs are not evidence that the full integration is complete.
 
@@ -900,7 +900,7 @@ spec:
       protocol: TCP
 ```
 
-The server uses `--custom-template-port` (default 8081; 0 disables this listener); existing `--port` stays unchanged. Enabling it requires explicit team authentication and the new CRDs/RBAC. The two listeners share one Manager/key-storage/configreload runtime. Library construction retains zero as disabled unless an independent custom port is supplied. SDK defaults to 8081 internally. A changed backend port requires an actual frontend mapping/internal SDK adaptation, not silent legacy-connection mutation or a new public URL option. Port collisions fail explicitly. Existing metrics/health/pprof listeners are not moved.
+The server uses `--custom-template-port` (default 0, disabled); the repository deployment explicitly passes `--custom-template-port=8081`, matching the Service example and the SDK's default derived port. Existing `--port` stays unchanged. Enabling the custom listener requires explicit team authentication and the new CRDs/RBAC. The two listeners share one Manager/key-storage/configreload runtime. Library construction also retains zero as disabled unless an independent custom port is supplied. A changed backend port requires an actual frontend mapping/internal SDK adaptation, not silent legacy-connection mutation or a new public URL option. Port collisions fail explicitly. Existing metrics/health/pprof listeners are not moved. Disabling the listener does not clean up previously persisted templates or their finalizers.
 
 <a id="risks"></a>
 
@@ -908,39 +908,23 @@ The server uses `--custom-template-port` (default 8081; 0 disables this listener
 
 | Risk / boundary | Mitigation or explicit tradeoff |
 | --- | --- |
+| Unintended custom API exposure | CLI listener defaults to disabled; repository deployment explicitly enables 8081 and must provide suitable authentication/TLS exposure |
 | Cluster-wide admin/legacy keys conflict with namespaced name routes | New API requires explicit team keys; admin/legacy receive 403, no default system namespace |
-| Stale or permanently filtered cache misses references/absence | Independent complete control view, required indexes, bounded approved real Get; no serving before ready |
+| Stale or permanently filtered cache misses references/absence | Independent complete control view, per-cache indexes, narrowly scoped live Get confirmations; no serving before ready or live List |
 | Complete management cache but filtered consumption cannot see pools | Verify companion visibility in supported deployments; do not cancel legacy filters |
 | Template controller repeatedly overwrites dynamic replicas | Mode follows persisted intent; size initializes only; missing autoscaler never resets an existing pool |
-| Old autoscaler/delete affects recreated or external same-name resources | Actual owner/target UID checks and observation reset; independent name DELETE is not historical identity binding |
+| Old autoscaler/delete affects recreated or external same-name resources | Matching PA/pool SandboxTemplate controller-owner namespace/name/UID, pool-UID sample reset, optimistic-lock resourceVersion replica patches, and UID/resourceVersion version-delete Preconditions; independent name DELETE is not historical identity binding |
+| Managed scaling mistaken for a liveness barrier | PA/pool cache checks observe their deletion only; no Claim/version reads/watches or companion-name/templateRef/mode checks at scaling, and no drain of submitted updates |
 | Ready mistaken for consumability | Explicit definition-only boundary; companion failures via Events/logs/owned child Conditions; existing consumption failures/retries |
 | PVC labels accepted without runtime propagation | Reject in custom DTO, retain native fields, later controlled support |
-| Partial failure leaves a reserved name | No hidden rollback/repair; query Unknown/actual version, then explicitly delete |
-| Request/process/controller exit loses cleanup | Synchronous finalizers, actual owner chain, durable deletion; timeout does not cancel |
-| No strong coordination permits concurrent failures/new invalid refs | Document races; no drain/reference transaction; keep identity/retention protections |
-| Insufficient finalizer/GC completion evidence | Validate inventory completion with parent protection; cached emptiness/parent NotFound alone is insufficient |
-| Direct CR writes forge Claim ownerReferences on create | The trust model is API-key tenants without CR write permission; same-namespace CR writers already hold stronger rights. Versions whose Claim is absent or mismatched are deleted by the controller; no create-side owner existence Get, because it cannot stop same-namespace adoption anyway |
+| Partial failure leaves a reserved name | Atomic Claim finalizer/allocation, bounded creation grace, no hidden rollback/repair; query Unknown/actual version, then explicitly delete |
+| Request/process/controller exit loses cleanup | Claim cleanup finalizer plus native foregroundDeletion and blocking owner chain; timeout does not cancel durable cleanup |
+| No strong coordination permits concurrent failures/new invalid refs | Document races; no drain/reference transaction or sibling PA-to-pool cleanup ordering; keep delivered-owner-detachment and PVC retention protections |
+| Insufficient finalizer/GC completion evidence | Retain Claim until owned versions are confirmed absent; cache-positive waits then live absence/UID-change confirmation, not cached emptiness/parent NotFound alone |
+| Obsolete custom version finalizers strand unreleased prototype resources | Controlled operator migration is required before upgrading; disabling the listener is not cleanup and finalizers must not be blindly removed |
+| Direct CR writes forge Claim ownerReferences on create | The trust model is API-key tenants without CR write permission; same-namespace CR writers already hold stronger rights. Orphaned/mismatched versions are foreground-deleted only after necessary live negative Claim UID confirmation. PA/pool owner matching is not an independent proof that the Claim/version still exists |
 
 Validate all input in team scope. Users cannot supply root metadata/system owners/scaling targets. Use existing structured logging/Events without new metrics, and never write sensitive keys/credentials into status.
-
-<a id="alternatives"></a>
-
-## Alternatives
-
-| Alternative | Why not selected |
-| --- | --- |
-| One SandboxTemplate combines logical name and all version identity | Simple for one build but constrains later multi-version naming/consumption; use minimal Claim |
-| Claim stores full spec or a default-version ref | Duplicates configuration/status or adds maintenance; name reservation and owner selection suffice now |
-| name is the concrete templateId | Does not separate builds under a logical name; use independent random IDs |
-| Expose templateId plus buildId/UID | Redundant identity for one build; keep UIDs internal |
-| Replace legacy-port /templates | Different protocol/view/deletion scope; use independent listener |
-| Separate public SandboxSet/PoolAutoscaler APIs | More user orchestration; nested warmPool intent supplies system relationships |
-| Full inheritance for every templateRef | Changes non-companion behavior; use actual-owner-scoped resolver |
-| Inline full policies into companion pools | Duplicates configuration and violates capacity-plus-ref model; inherit during resolution |
-| Ready waits for pool/autoscaler/one ready stock item | Conflicts with zero-size default and decoupled capacity; Ready is static definition validation |
-| If-Match/delete token for cross-recreation retries | Adds public identity/conditional deletion; retain explicit name-only retry limits |
-| Real List to fix cache gaps | Violates read discipline; independent informers and bounded approved Get |
-| Name locks/consumption barrier for strong delete transaction | Out of scope/cost; identity safeguards and durable cleanup are still required |
 
 <a id="upgrade"></a>
 
@@ -950,8 +934,9 @@ Validate all input in team scope. Users cannot supply root metadata/system owner
 - Claim is a new CRD. Do not adopt, migrate, or rename existing pool-generated templates or checkpoint versions into Claims.
 - WarmPool is additive to existing BuildOptions. Retain the four historical fields, full native PVC fields, and existing status; no persisted-field removal or semantic change without migration.
 - Apply immutability/definition-phase maintenance to Claim-managed versions only, not a universal new contract for all native CRs.
-- Expose the new API only after fields/schema/controllers/new port are ready. An old controller does not honor warmPool merely because admission accepts it.
-- Rollback/mixed versions must retain working cleanup for existing Claim/version finalizers. Disabling the listener/reverting code does not promise automatic cleanup; do not manually clear finalizers as a compatibility strategy.
+- Expose the new API only after fields/schema/controllers/new port are ready. The CLI defaults to disabled; repository deployment explicitly enables 8081. An old controller does not honor warmPool merely because admission accepts it.
+- New versions have no custom template cleanup finalizer. Before upgrading any cluster that used unreleased older prototypes with custom version finalizers, perform a controlled operator migration that preserves ownership, required inventory/Pod cleanup, delivered-instance protection, and PVC retention. Do not assume the new controller will release obsolete finalizers or blindly remove them to unblock deletion.
+- Rollback/mixed versions must retain working Claim-finalizer and native foreground cleanup for persisted resources. Disabling the listener or reverting code is not cleanup and does not replace the required prototype migration.
 - The resource model reserves future 1:N space only; rebuilding, tags, default-version publication, upgrades, and rollbacks are not implemented in this release.
 
 <a id="test-plan"></a>
@@ -961,34 +946,27 @@ Validate all input in team scope. Users cannot supply root metadata/system owner
 | Area | Required coverage |
 | --- | --- |
 | Names/IDs | Boundary names, same-team concurrent conflicts/cross-team duplicate names, 20-character IDs, overlapping name/ID formats interpreted by route role |
-| Create/failure | Static 400 before Claim, both atomic finalizers/owner, full version before 201 always Pending, retained partial failure and 409 until explicit deletion |
+| Create/failure | Static 400 before Claim, Claim cleanup finalizer and allocation in the same Create, actual Claim UID version owner with no custom version finalizer, full version before 201 always Pending, bounded writes/creation grace, retained partial failure and 409 until explicit deletion |
 | CR compatibility | Four legacy BuildOptions fields plus WarmPool, schema/DeepCopy retention; custom legacy-field 400, old path still works |
 | Options/policies | true/0 defaults, null/absence, disabled explicit-zero rejection, empty autoscaler rejection, full capacity/cron, percentage/window bounds, size below min allowed/above max rejected |
+| Strict API input | Unknown fields, unsupported types/query parameters and invalid explicit nulls remain 400; allowed omitted/null options retain defaults; no widened root metadata or PVC input |
 | Definition state | Four native status fields/current generation, Unknown/Deleting projections, deterministic vs transient failures, no forced Building delay/runtime build |
-| Replica ownership | Fixed continuous size; auto initial size only; missing autoscaler does not reset replicas; pool recreation/target UID observations |
-| Companion identity | Matching names/namespace/actual UIDs, target pool, no external-resource adoption; version Event/log even when child creation fails |
-| Inheritance/hash | Full genuine-companion inventory/cold inheritance, common revision source, deep copy, wrong UID/inline conflict errors, non-companion fields/hash unchanged |
-| Query/wait | A creates/B cache lags without false bound-GET 404; negative confirmation after replica switch; default/LIST eventual; wait never follows another version, timeout does not cancel |
-| Cache/references | Independent index registration, no fail-open on missing index; unlabeled external pool still 409; original omitted kind/apiVersion defaults; inadequate scope/RBAC not served; no real List |
-| Delete/recovery | Immediate DELETE, creator exit, version/cleanup restart; first delete only pinned Claim, explicit sibling ordering, full inventory completion before 204, cache absence not true absence |
-| Retries/concurrency | Internal retries pin UID; independent name retry may affect replacement; in-flight consumption may succeed/fail, new refs may break but external resources are not deleted |
-| Entrypoints | New/legacy port isolation, scheme/TLS/host inheritance, old port/path replacement, IPv6, no global E2B_API_URL mutation; Service/external TLS reachability |
+| Replica ownership | Fixed continuous size; auto initial size only; missing autoscaler does not reset replicas; pool recreation resets target UID samples/cooldowns |
+| Managed scaling | PA/pool actual SandboxTemplate controller-owner namespace/name/UID match and observed deletion; no Claim/version reads/watches or companion-name/templateRef/mode checks; optimistic-lock resourceVersion merge patches reject conflicts and same-name pool replacement |
+| Companion identity | Matching names/namespace/actual UIDs and blocking owner references, target pool, no external-resource adoption; version Event/log even when child creation fails |
+| Inheritance/hash | Full genuine-companion inventory/cold inheritance through ResolveTemplateSpec, common revision source, deep copy, wrong UID/inline conflict errors; non-companion projection includes every copied/hashed pool policy without changing inheritance |
+| Layering | Neutral templateconfig.Definition across Manager/Infra; CR spec conversion stays in Sandbox CR Infra; new controller dependencies never import API/Manager implementations or widen existing reverse-dependency debt |
+| Query/wait | Single GET/DELETE live current Claim identity; A creates/B cache lags without false bound-GET 404; negative confirmation after replica switch; default version selection/LIST eventual; wait never follows another version, timeout does not cancel |
+| Cache/references | Per-cache ClaimOwner registration for Manager and Template/Claim controllers; Manager TemplateRef and existing SandboxSet TemplateRef registration; no VersionOwner cleanup index, no fail-open on missing index; unlabeled external pool still 409; original omitted kind/apiVersion defaults; inadequate scope/RBAC not served; no live List |
+| Controller reads | Stable positive Claim/version loops are cache-first with no 30-second steady poll; live reads only for negative Claim UID and known allocated-version confirmation; creation-grace/cleanup retries remain bounded |
+| Delete/recovery | Immediate DELETE, creator exit, controller restart; first delete only pinned Claim; Foreground version Delete with UID/resourceVersion Preconditions; concurrent sibling GC, no PA-to-pool ordering or acknowledgement annotation; native foregroundDeletion retains blocking inventory/Pod descendants, including after pool loss; Claim finalizer stays until versions confirmed absent |
+| Deletion completion | Cache-positive pinned Claim waits without repeated live reads; cache absence/UID change needs live confirmation before 204; incomplete or unconfirmable cleanup remains 503 |
+| Retries/concurrency | Internal retries pin UID; independent name retry may affect replacement; in-flight consumption may succeed/fail, delivered owners stay detached, new refs may break but external resources are not deleted |
+| Entrypoints | CLI default 0 disables custom listener; explicit repository deployment and SDK-derived default use 8081; new/legacy port isolation, scheme/TLS/host inheritance, old port/path replacement, IPv6, no global E2B_API_URL mutation; port collision and Service/external TLS reachability |
 | PVC | name/spec materialization; labels/annotations/system metadata 400; native field and retention preservation |
+| Upgrade | Controlled operator migration of unreleased prototype custom version finalizers before upgrade; disabling listener does not perform cleanup; Claim/native foreground guarantees survive supported rollback/mixed versions |
 
-Reuse existing test infrastructure and real implementations first, with the narrowest tests for changed responsibilities. Static example checks are not controller/webhook/SDK/cluster acceptance. Writing this proposal does not authorize E2E execution or cluster resource creation.
-
-<a id="history"></a>
-
-## Implementation History
-
-- **2026-11-13:** Consolidated the agreed design and review decisions into this English repository proposal. Chinese review material, implementation planning, and P0 readiness records remain in the separate documentation workspace.
-- **Local P0-P2 foundation completed:** Claim/WarmPool types and generated artifacts, shared static validation/defaulting, pure indexes, and effective-configuration resolution with the required materialization/revision integration are implemented locally. Targeted unit/schema/regression and concurrent-normalization race tests passed. This records local development, not a released feature.
-- **November 13, 2026 - local P3-P5 implementation:** Added the optional neutral TemplateStore and independent indexed control view, approved keyed confirmations, strict flat API input, shared authentication/new listener, Manager CRUD orchestration, definition/fixed-pool reconcilers, and finalizer/foreground-GC cleanup. Local tests cover namespace/UID/cache negatives, partial creation, routing/authorization/presence, definition status, capacity ownership, collision visibility, and durable cleanup ordering. This records a local implementation checkpoint, not a released feature.
-- **P6 implemented locally:** The definition controller creates/recreates a sibling PoolAutoscaler with complete persisted capacity/cron policy and explicit SandboxSet GVK, never adopting a foreign same-name autoscaler. Automatic-mode pool replicas are initialized only on pool creation/recreation; missing autoscalers do not reset an existing pool. Managed scaling checks actual version/pool/Claim UID ownership and observed deletion using cached Gets, rechecks cached identities before writes, and atomically tests pool UID/resourceVersion. Managed monitor samples and cooldowns bind to the actual pool UID. Claim/version events wake managed autoscalers. Existing unmanaged capacity/cron algorithms are retained. These cached checks do not strengthen the documented no-drain/no-strong-coordination guarantee.
-- **P7 implemented locally in `openkruise/agents-api`:** The SDK lives under `e2b/python/openkruise_agents`, not in this repository. The branch is based on upstream master `6be2827`. Additive exports retain `kruise_agents`, the old patch and the original E2B Sandbox implementation. Build/get/list/delete and version-bound wait use the internal 8081 origin derived from the final E2B URL. Models cover full native PodSpec plus Sandbox policy and complete warm-pool/autoscaler options, preserving field presence. Workload models use the optional `custom-template` dependency extra; the original package dependency lower bounds and Python support are unchanged. No public custom URL/port/client option or automatic POST/DELETE rollback/replay is added.
-- **Local commits:** P6 backend changes are committed as `5812f6a6` in agents; P7 SDK changes are committed as `d38af82` in agents-api. Neither branch has been pushed.
-- **P8 configuration/test scaffolding prepared locally:** The manager Service and Deployment expose explicit 8081 alongside unchanged legacy ports/probes/routes. The generated controller RBAC includes `events.k8s.io/events` for the new Event Recorder while retaining core Event access. An optional separate TLS test frontend is available under `config/sandbox-manager-custom-template-tls`, requiring an existing certificate Secret and explicit frontend exposure; it does not hijack the legacy Ingress or automatically provision a public 8081/TLS endpoint. The opt-in acceptance suite lives separately in `test-workspace/suites/custom-template-api`, with offline checks and gated protocol/owner/runtime/fault cases. Configuration and test preparation do not imply live validation.
-- **Remaining P8:** Actual external 8081/TLS exposure and real cluster/GC/fault acceptance. Unit/mock HTTP and fake-client tests are not proof of live informer/GC/runtime behavior. No deployment, personal kubeconfig, cluster connection, or E2E validation is claimed.
+Reuse existing test infrastructure and real implementations first, with the narrowest tests for changed responsibilities. Static examples, unit tests, mock HTTP, and in-process clients are not proof of live controller/webhook/SDK/informer/GC/runtime acceptance. Validate the required integration, foreground-GC, restart, and fault behavior before exposure.
 
 <a id="references"></a>
 
@@ -1001,13 +979,13 @@ Reuse existing test infrastructure and real implementations first, with the narr
 - [Checkpoint API Extension](20260915-checkpoint-api-extension.md): existing persistence/compatibility boundary, not checkpoint support in custom build options.
 - [Sandbox Lifecycle Hooks](20261021-sandbox-lifecycle-hooks.md): scenarios, concurrency, and acceptance structure; this proposal reuses existing types/constraints only.
 
-### Source Review Baseline
+### Source Contracts
 
-The implementation branch started from `openkruise/agents@3c14b7e6c`. Existing types and paths are implementation constraints, not proof that the new end-to-end feature is complete.
+The following types and paths define existing compatibility and integration boundaries; their presence alone is not proof of end-to-end feature acceptance.
 
 - [SandboxTemplate types](../../api/v1alpha1/sandboxtemplate_types.go) and [schema tests](../../api/v1alpha1/sandboxtemplate_schema_test.go): persisted BuildOptions/status compatibility.
 - [SandboxSet types](../../api/v1alpha1/sandboxset_types.go) and [PoolAutoscaler types](../../api/v1alpha1/poolautoscaler_types.go): complete existing pool/policy definitions.
-- [Pool materialization](../../pkg/lifecycle/pool/materialize.go) and [SandboxSet revision](../../pkg/controller/sandboxset/revision.go): inventory/cold creation and configuration/hash source.
+- [Template configuration](../../pkg/templateconfig/definition.go), [pool materialization](../../pkg/lifecycle/pool/materialize.go), and [SandboxSet revision](../../pkg/controller/sandboxset/revision.go): neutral Definition boundary and shared effective configuration for inventory/cold creation and revision hashes.
 - [SandboxSet controller](../../pkg/controller/sandboxset/sandboxset_controller.go) and [field index registration](../../pkg/utils/fieldindex/register.go): current templateRef indexing/controller registration.
 - [Template validation](../../pkg/webhook/sandboxtemplate/validating/sandboxtemplate_create_update.go) and [autoscaler validation](../../pkg/webhook/poolautoscaler/validating/poolautoscaler_validate.go): native validation boundaries.
 - [Sandbox controller](../../pkg/controller/sandbox/sandbox_controller.go): current PVC materialization; storable metadata is not automatically propagated.

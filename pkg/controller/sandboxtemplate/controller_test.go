@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-	http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package sandboxtemplate
 
 import (
@@ -45,7 +46,7 @@ const testVersionID = "a7f2k9m4p1q8r3s6t0v5"
 
 func fixture() (*api.SandboxTemplateClaim, *api.SandboxTemplate) {
 	c := &api.SandboxTemplateClaim{ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "python-agent", UID: "claim-uid", Finalizers: []string{api.SandboxTemplateClaimCleanupFinalizer}, Annotations: map[string]string{templatecreation.AllocationAnnotation: testVersionID, templatecreation.CreationCompleteAnnotation: "true"}}}
-	v := &api.SandboxTemplate{ObjectMeta: metav1.ObjectMeta{Namespace: c.Namespace, Name: testVersionID, UID: "version-uid", Generation: 1, Finalizers: []string{api.SandboxTemplateCleanupFinalizer}, OwnerReferences: []metav1.OwnerReference{{APIVersion: api.GroupVersion.String(), Kind: "SandboxTemplateClaim", Name: c.Name, UID: c.UID, Controller: ptr.To(true), BlockOwnerDeletion: ptr.To(true)}}}, Spec: api.SandboxTemplateSpec{Backend: "k8s", BuildOptions: &api.SandboxTemplateBuildOptions{WarmPool: &api.SandboxTemplateWarmPoolOptions{Enabled: ptr.To(true), Size: ptr.To(int32(2))}}, Template: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "python:3.12"}}}}, Runtimes: []api.RuntimeConfig{{Name: "agent-runtime"}}}}
+	v := &api.SandboxTemplate{ObjectMeta: metav1.ObjectMeta{Namespace: c.Namespace, Name: testVersionID, UID: "version-uid", Generation: 1, OwnerReferences: []metav1.OwnerReference{{APIVersion: api.GroupVersion.String(), Kind: "SandboxTemplateClaim", Name: c.Name, UID: c.UID, Controller: ptr.To(true), BlockOwnerDeletion: ptr.To(true)}}}, Spec: api.SandboxTemplateSpec{Backend: "k8s", BuildOptions: &api.SandboxTemplateBuildOptions{WarmPool: &api.SandboxTemplateWarmPoolOptions{Enabled: ptr.To(true), Size: ptr.To(int32(2))}}, Template: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "python:3.12"}}}}, Runtimes: []api.RuntimeConfig{{Name: "agent-runtime"}}}}
 	return c, v
 }
 func fixtureClient(t *testing.T, objects ...client.Object) (client.WithWatch, *runtime.Scheme) {
@@ -58,9 +59,7 @@ func fixtureClient(t *testing.T, objects ...client.Object) (client.WithWatch, *r
 		t.Fatal(err)
 	}
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(objects...).WithStatusSubresource(&api.SandboxTemplate{}).
-		WithIndex(&api.SandboxTemplate{}, templateindex.ClaimOwner, templateindex.ClaimOwnerUID).
-		WithIndex(&api.SandboxSet{}, templateindex.VersionOwner, templateindex.VersionOwnerUID).
-		WithIndex(&api.PoolAutoscaler{}, templateindex.VersionOwner, templateindex.VersionOwnerUID).Build()
+		WithIndex(&api.SandboxTemplate{}, templateindex.ClaimOwner, templateindex.ClaimOwnerUID).Build()
 	return c, s
 }
 func TestTemplateDefinitionAndFixedPool(t *testing.T) {
@@ -166,118 +165,72 @@ func TestTemplateAutomaticIntentDoesNotResetReplicas(t *testing.T) {
 	}
 }
 
-// The fake models API persistence only. We explicitly deliver GC completion
-// events below; this is an ordering/finalizer test, not real GC validation.
-func TestTemplateCleanupOrderingAndDurability(t *testing.T) {
-	c, v := fixture()
-	base, scheme := fixtureClient(t, c, v)
-	r := &Reconciler{Client: base, Reader: base, Scheme: scheme}
-	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(v)}
-	if _, err := r.ReconcileVersion(t.Context(), req); err != nil {
-		t.Fatal(err)
-	}
-	pa := &api.PoolAutoscaler{ObjectMeta: metav1.ObjectMeta{Namespace: v.Namespace, Name: v.Name, UID: "autoscaler-uid", Finalizers: []string{"test/pending-autoscaler"}}}
-	if err := controllerutil.SetControllerReference(v, pa, scheme); err != nil {
-		t.Fatal(err)
-	}
-	if err := base.Create(t.Context(), pa); err != nil {
-		t.Fatal(err)
-	}
-	writes := []string{}
-	writer := interceptor.NewClient(base, interceptor.Funcs{Delete: func(ctx context.Context, cl client.WithWatch, o client.Object, opts ...client.DeleteOption) error {
-		writes = append(writes, fmt.Sprintf("%T", o))
-		options := (&client.DeleteOptions{}).ApplyOptions(opts)
-		if options.PropagationPolicy != nil && *options.PropagationPolicy == metav1.DeletePropagationForeground {
-			current := o.DeepCopyObject().(client.Object)
-			if err := cl.Get(ctx, client.ObjectKeyFromObject(o), current); err != nil {
-				return err
-			}
-			if options.Preconditions != nil && options.Preconditions.ResourceVersion != nil && *options.Preconditions.ResourceVersion != current.GetResourceVersion() {
-				t.Fatal("caller supplied a stale delete snapshot")
-			}
-			if !controllerutil.ContainsFinalizer(current, metav1.FinalizerDeleteDependents) {
+// The fake models foreground-finalizer persistence, not garbage collection.
+func TestTemplateForegroundCleanupHoldsClaim(t *testing.T) {
+	for _, initiator := range []string{"claim", "version"} {
+		t.Run(initiator, func(t *testing.T) {
+			c, v := fixture()
+			base, scheme := fixtureClient(t, c, v)
+			deletes := 0
+			writer := interceptor.NewClient(base, interceptor.Funcs{Delete: func(ctx context.Context, cl client.WithWatch, o client.Object, opts ...client.DeleteOption) error {
+				deletes++
+				options := (&client.DeleteOptions{}).ApplyOptions(opts)
+				if _, ok := o.(*api.SandboxTemplate); !ok || ptr.Deref(options.PropagationPolicy, "") != metav1.DeletePropagationForeground {
+					t.Fatal("cleanup must request foreground deletion of the version only")
+				}
+				current := &api.SandboxTemplate{}
+				if err := cl.Get(ctx, client.ObjectKeyFromObject(o), current); err != nil {
+					return err
+				}
+				if options.Preconditions == nil || ptr.Deref(options.Preconditions.UID, "") != current.UID || ptr.Deref(options.Preconditions.ResourceVersion, "") != current.ResourceVersion {
+					t.Fatal("foreground deletion must pin UID and resourceVersion")
+				}
 				controllerutil.AddFinalizer(current, metav1.FinalizerDeleteDependents)
 				if err := cl.Update(ctx, current); err != nil {
 					return err
 				}
+				// The fake needs a separate Update to model the API server's atomic GC finalizer.
+				options.Preconditions.ResourceVersion = &current.ResourceVersion
+				return cl.Delete(ctx, current, options)
+			}})
+			if err := base.Delete(t.Context(), c); err != nil {
+				t.Fatal(err)
 			}
-			// The real API server checks preconditions before atomically adding the
-			// GC finalizer. The fake needed a separate Update above, so use that
-			// updated RV only after verifying the original precondition.
-			adjusted := *options
-			adjusted.Preconditions = &metav1.Preconditions{UID: ptr.To(current.GetUID()), ResourceVersion: ptr.To(current.GetResourceVersion())}
-			return cl.Delete(ctx, current, &adjusted)
-		}
-		return cl.Delete(ctx, o, opts...)
-	}})
-	r.Client = writer
-	if err := base.Delete(t.Context(), c); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 2; i++ {
-		if _, err := r.ReconcileVersion(t.Context(), req); err != nil {
-			t.Fatal(err)
-		}
-	}
-	p := &api.SandboxSet{}
-	if err := base.Get(t.Context(), req.NamespacedName, p); err != nil || p.DeletionTimestamp != nil {
-		t.Fatal("pool removed before autoscaler completed")
-	}
-	finish := func(o client.Object) {
-		t.Helper()
-		if err := base.Get(t.Context(), client.ObjectKeyFromObject(o), o); err != nil {
-			t.Fatal(err)
-		}
-		o.SetFinalizers(nil)
-		if err := base.Update(t.Context(), o); err != nil {
-			t.Fatal(err)
-		}
-	}
-	finish(pa)
-	if _, err := r.ReconcileVersion(t.Context(), req); err != nil {
-		t.Fatal(err)
-	}
-	if err := base.Get(t.Context(), req.NamespacedName, p); err != nil || p.DeletionTimestamp == nil {
-		t.Fatal("pool cleanup not triggered")
-	}
-	if _, err := r.ReconcileClaim(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(c)}); err != nil {
-		t.Fatal(err)
-	}
-	held := &api.SandboxTemplateClaim{}
-	if err := base.Get(t.Context(), client.ObjectKeyFromObject(c), held); err != nil {
-		t.Fatal("Claim released while descendants pending")
-	}
-	finish(p)
-	// Reconstruct the reconciler as a process-restart simulation. No request
-	// memory is used to discover the remaining version/GC barrier.
-	r = &Reconciler{Client: writer, Reader: base, Scheme: scheme}
-	for i := 0; i < 2; i++ {
-		if _, err := r.ReconcileVersion(t.Context(), req); err != nil {
-			t.Fatal(err)
-		}
-	}
-	current := &api.SandboxTemplate{}
-	if err := base.Get(t.Context(), req.NamespacedName, current); err != nil {
-		t.Fatal(err)
-	}
-	if !controllerutil.ContainsFinalizer(current, metav1.FinalizerDeleteDependents) || controllerutil.ContainsFinalizer(current, api.SandboxTemplateCleanupFinalizer) {
-		t.Fatalf("finalizers=%v", current.Finalizers)
-	}
-	if _, err := r.ReconcileClaim(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(c)}); err != nil {
-		t.Fatal(err)
-	}
-	if err := base.Get(t.Context(), client.ObjectKeyFromObject(c), held); err != nil {
-		t.Fatal("Claim released before foreground inventory GC")
-	}
-	finish(current)
-	if _, err := r.ReconcileClaim(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(c)}); err != nil {
-		t.Fatal(err)
-	}
-	if err := base.Get(t.Context(), client.ObjectKeyFromObject(c), held); !apierrors.IsNotFound(err) {
-		t.Fatalf("claim not removed: %v", err)
-	}
-	if len(writes) < 4 {
-		t.Fatalf("cleanup writes=%v", writes)
+			r := &Reconciler{Client: writer, Reader: base, Scheme: scheme}
+			claimReq := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(c)}
+			if initiator == "claim" {
+				if _, err := r.ReconcileClaim(t.Context(), claimReq); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := r.ReconcileVersion(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(v)}); err != nil {
+				t.Fatal(err)
+			}
+			r = &Reconciler{Client: writer, Reader: base, Scheme: scheme}
+			if _, err := r.ReconcileClaim(t.Context(), claimReq); err != nil {
+				t.Fatal(err)
+			}
+			held := &api.SandboxTemplateClaim{}
+			if err := base.Get(t.Context(), claimReq.NamespacedName, held); err != nil {
+				t.Fatal("Claim released before foreground GC completed", err)
+			}
+			current := &api.SandboxTemplate{}
+			if err := base.Get(t.Context(), client.ObjectKeyFromObject(v), current); err != nil {
+				t.Fatal(err)
+			}
+			if current.DeletionTimestamp == nil || !controllerutil.ContainsFinalizer(current, metav1.FinalizerDeleteDependents) || deletes != 1 {
+				t.Fatalf("version=%+v deletes=%d", current, deletes)
+			}
+			controllerutil.RemoveFinalizer(current, metav1.FinalizerDeleteDependents)
+			if err := base.Update(t.Context(), current); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := r.ReconcileClaim(t.Context(), claimReq); err != nil {
+				t.Fatal(err)
+			}
+			if err := base.Get(t.Context(), claimReq.NamespacedName, held); !apierrors.IsNotFound(err) {
+				t.Fatalf("Claim not removed after GC: %v", err)
+			}
+		})
 	}
 }
 func TestTemplateEmptyClaimCreatorExitGrace(t *testing.T) {
@@ -310,21 +263,37 @@ func TestTemplateEmptyClaimCreatorExitGrace(t *testing.T) {
 	}
 }
 
-func TestTemplateCleanupCompletedForegroundDoesNotRearmGC(t *testing.T) {
-	c, v := fixture()
-	v.Annotations = map[string]string{templatecreation.CleanupForegroundAnnotation: "true"}
-	// This is the durable state after zero-stock GC already removed its own
-	// foregroundDeletion finalizer, while the custom cleanup finalizer remains.
-	backend, scheme := fixtureClient(t, c, v)
-	if err := backend.Delete(t.Context(), v); err != nil {
-		t.Fatal(err)
-	}
-	r := &Reconciler{Client: backend, Reader: backend, Scheme: scheme}
-	if _, err := r.ReconcileVersion(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(v)}); err != nil {
-		t.Fatal(err)
-	}
-	current := &api.SandboxTemplate{}
-	if err := backend.Get(t.Context(), client.ObjectKeyFromObject(v), current); !apierrors.IsNotFound(err) {
-		t.Fatalf("completed GC was unnecessarily rearmed: %v", err)
+func TestTemplateVersionConfirmsOnlyNegativeClaimObservations(t *testing.T) {
+	for _, state := range []string{"current", "missing", "old UID"} {
+		t.Run(state, func(t *testing.T) {
+			c, v := fixture()
+			objects := []client.Object{v}
+			if state != "missing" {
+				cachedClaim := c.DeepCopy()
+				if state == "old UID" {
+					cachedClaim.UID = "old-claim"
+				}
+				objects = append(objects, cachedClaim)
+			}
+			cached, scheme := fixtureClient(t, objects...)
+			live, _ := fixtureClient(t, c)
+			reads := 0
+			reader := interceptor.NewClient(live, interceptor.Funcs{Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				reads++
+				return cl.Get(ctx, key, obj, opts...)
+			}})
+			r := &Reconciler{Client: cached, Reader: reader, Scheme: scheme}
+			result, err := r.ReconcileVersion(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(v)})
+			if err != nil || result.RequeueAfter != 0 {
+				t.Fatalf("result=%+v error=%v", result, err)
+			}
+			want := 1
+			if state == "current" {
+				want = 0
+			}
+			if reads != want {
+				t.Fatalf("live reads=%d want=%d", reads, want)
+			}
+		})
 	}
 }

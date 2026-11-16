@@ -18,13 +18,8 @@ package v1alpha1
 
 import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-const (
-	// SandboxTemplateClaimCleanupFinalizer holds the logical name until its
-	// owned versions and managed dependents have finished normal cleanup.
-	SandboxTemplateClaimCleanupFinalizer = "agents.kruise.io/template-claim-cleanup"
-	// SandboxTemplateCleanupFinalizer protects one concrete managed version.
-	SandboxTemplateCleanupFinalizer = "agents.kruise.io/template-cleanup"
-)
+// SandboxTemplateClaimCleanupFinalizer holds the logical name until owned versions finish foreground GC.
+const SandboxTemplateClaimCleanupFinalizer = "agents.kruise.io/template-claim-cleanup"
 
 // +genclient
 // +genclient:noStatus

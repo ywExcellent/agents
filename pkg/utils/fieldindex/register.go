@@ -22,6 +22,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -31,7 +32,7 @@ import (
 )
 
 const (
-	IndexNameForOwnerRefUID           = templateindex.OwnerUID
+	IndexNameForOwnerRefUID           = "ownerRefUID"
 	IndexNameForCheckpointSandboxName = "checkpointSandboxName"
 	IndexNameForSandboxSetTemplateRef = templateindex.TemplateRef
 )
@@ -40,7 +41,12 @@ var (
 	registerOnce sync.Once
 )
 
-var OwnerIndexFunc = templateindex.ControllerOwnerUID
+var OwnerIndexFunc = func(obj client.Object) []string {
+	if owner := metav1.GetControllerOfNoCopy(obj); owner != nil {
+		return []string{string(owner.UID)}
+	}
+	return nil
+}
 
 // CheckpointSandboxNameIndexFunc indexes checkpoints by spec.sandboxName,
 // falling back to spec.podName for checkpoints created from a running Pod.

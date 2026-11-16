@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-	http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package template
 
 import (
@@ -97,10 +98,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 func (s *Server) Close() error { return s.http.Close() }
 func output(summary sandboxmanager.TemplateSummary) response {
-	result := response{Name: summary.Name, Status: summary.Status, Message: ""}
-	if summary.Status == "Failed" {
-		result.Message = summary.Message
-	}
+	result := response{Name: summary.Name, Status: summary.Status, Message: summary.Message}
 	if summary.ID != "" {
 		id := summary.ID
 		result.TemplateID = &id
@@ -122,10 +120,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fail := func(code int, message string) {
 		writeJSON(w, code, errorResponse{Code: code, Message: message, RequestID: requestID})
 	}
-	if s.authorize == nil {
-		fail(401, "Invalid API Key")
-		return
-	}
 	key := r.Header.Get("X-API-Key")
 	if key == "" {
 		fail(401, "Invalid API Key")
@@ -142,10 +136,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if namespace == "" {
 		fail(403, "A team-scoped API key is required.")
-		return
-	}
-	if s.manager == nil {
-		fail(503, "Template capability is unavailable.")
 		return
 	}
 	path := r.URL.Path

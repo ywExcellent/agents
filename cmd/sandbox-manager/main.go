@@ -45,7 +45,6 @@ import (
 	"github.com/openkruise/agents/pkg/servers/e2b"
 	"github.com/openkruise/agents/pkg/servers/e2b/keys"
 	"github.com/openkruise/agents/pkg/servers/e2b/models"
-	"github.com/openkruise/agents/pkg/servers/template"
 	"github.com/openkruise/agents/pkg/tracing"
 	"github.com/openkruise/agents/pkg/utils"
 	utilfeature "github.com/openkruise/agents/pkg/utils/feature"
@@ -144,7 +143,7 @@ func main() {
 
 	// Register server configuration flags
 	pflag.IntVar(&port, "port", 8080, "The port the server listens on")
-	pflag.IntVar(&customTemplatePort, "custom-template-port", template.DefaultPort, "Independent custom Template API port (0 disables it; requires team authentication)")
+	pflag.IntVar(&customTemplatePort, "custom-template-port", 0, "Independent custom Template API port (0 disables it; requires team authentication)")
 	pflag.IntVar(&metricsPort, "metrics-port", 0,
 		"Port for GET /metrics and GET /health; 0 or the same value as --port serves both on the control API listener")
 	pflag.StringVar(&e2bAdminKey, "e2b-admin-key", "", "E2B admin API key. Empty skips creating and rotating the canonical admin key; --e2b-enable-auth still controls authentication")

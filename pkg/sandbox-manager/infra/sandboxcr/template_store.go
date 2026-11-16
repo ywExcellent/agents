@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-	http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package sandboxcr
 
 import (
@@ -121,7 +122,7 @@ func (s *templateStore) CreateVersion(ctx context.Context, c infra.TemplateClaim
 		return templateStoreError(err)
 	}
 	v := &api.SandboxTemplate{ObjectMeta: metav1.ObjectMeta{Namespace: c.Namespace, Name: id,
-		Finalizers: []string{api.SandboxTemplateCleanupFinalizer}, OwnerReferences: []metav1.OwnerReference{{APIVersion: api.GroupVersion.String(), Kind: "SandboxTemplateClaim", Name: c.Name, UID: types.UID(c.UID), Controller: ptr.To(true), BlockOwnerDeletion: ptr.To(true)}}}, Spec: *d.TemplateSpec()}
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: api.GroupVersion.String(), Kind: "SandboxTemplateClaim", Name: c.Name, UID: types.UID(c.UID), Controller: ptr.To(true), BlockOwnerDeletion: ptr.To(true)}}}, Spec: *d.TemplateSpec()}
 	err := s.writer.Create(writeCtx, v, &client.CreateOptions{FieldValidation: metav1.FieldValidationStrict})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
@@ -187,13 +188,14 @@ func ownedTemplate(v *api.SandboxTemplate, c infra.TemplateClaimIdentity) bool {
 	return v.Namespace == c.Namespace && o != nil && o.Name == c.Name && string(o.UID) == c.UID
 }
 func observeTemplateVersion(v *api.SandboxTemplate) infra.TemplateVersionObservation {
-	o := infra.TemplateVersionObservation{ID: v.Name, UID: string(v.UID), CreatedAt: v.CreationTimestamp.Time, Generation: v.Generation, ObservedGeneration: v.Status.ObservedGeneration, Phase: string(v.Status.Phase), Deleting: v.DeletionTimestamp != nil}
-	if c := meta.FindStatusCondition(v.Status.Conditions, templatecreation.DefinitionCondition); c != nil && c.ObservedGeneration == v.Generation {
-		o.DefinitionReady = c.Status == metav1.ConditionTrue
-		o.DefinitionFailed = c.Status == metav1.ConditionFalse && c.Reason == "InvalidDefinition"
-		if o.DefinitionFailed {
-			o.Message = c.Message
-		}
+	o := infra.TemplateVersionObservation{ID: v.Name, Phase: string(api.SandboxTemplatePhasePending), CreatedAt: v.CreationTimestamp.Time, Deleting: v.DeletionTimestamp != nil}
+	switch phase := templatecreation.DefinitionPhase(v); {
+	case phase == api.SandboxTemplatePhaseFailed:
+		o.Phase, o.Message = string(phase), meta.FindStatusCondition(v.Status.Conditions, templatecreation.DefinitionCondition).Message
+	case phase != "":
+		o.Phase = string(phase)
+	case v.Status.Phase == api.SandboxTemplatePhaseBuilding:
+		o.Phase = string(api.SandboxTemplatePhaseBuilding)
 	}
 	return o
 }
@@ -273,8 +275,8 @@ func (s *templateStore) HasExternalReferences(ctx context.Context, c infra.Templ
 			if ref == nil || ref.Name != v.Name {
 				continue
 			}
-			owner := metav1.GetControllerOfNoCopy(p)
-			if p.Name != v.Name || owner == nil || owner.APIVersion != api.GroupVersion.String() || owner.Kind != "SandboxTemplate" || owner.Name != v.Name || owner.UID != v.UID {
+			owner := templateindex.VersionOwnerReference(p)
+			if p.Name != v.Name || owner == nil || owner.Name != v.Name || owner.UID != v.UID {
 				return true, nil
 			}
 		}
@@ -296,13 +298,21 @@ func (s *templateStore) Deleted(ctx context.Context, c infra.TemplateClaimIdenti
 	if err := s.check(ctx, c.Namespace); err != nil {
 		return false, err
 	}
+	key := client.ObjectKey{Namespace: c.Namespace, Name: c.Name}
 	current := &api.SandboxTemplateClaim{}
-	err := s.live.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: c.Name}, current)
+	err := s.cached.Get(ctx, key, current)
+	if err == nil && string(current.UID) == c.UID {
+		return false, nil
+	}
 	if err != nil && !apierrors.IsNotFound(err) {
 		return false, templateStoreError(err)
 	}
-	// Normal controller cleanup releases the parent last. Replacements never
-	// become deletion targets of an already-pinned request.
+	// A cached absence or replacement is confirmed live once. Normal controller
+	// cleanup releases the parent last, and replacements never become targets.
+	err = s.live.Get(ctx, key, current)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return false, templateStoreError(err)
+	}
 	return apierrors.IsNotFound(err) || string(current.UID) != c.UID, nil
 }
 

@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-	http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,16 +13,18 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package template
 
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"reflect"
 
 	corev1 "k8s.io/api/core/v1"
+	sigsjson "sigs.k8s.io/json"
 
 	api "github.com/openkruise/agents/api/v1alpha1"
 	"github.com/openkruise/agents/pkg/templateconfig"
@@ -56,16 +58,13 @@ func decodeCreate(body io.Reader) (createInput, error) {
 	if len(raw) > 2*1024*1024 {
 		return in, fmt.Errorf("request body too large")
 	}
-	if err := rejectDuplicateKeys(json.NewDecoder(bytes.NewReader(raw))); err != nil {
+	// Kubernetes strict decoding: case-sensitive names, no unknown or duplicate fields.
+	strict, err := sigsjson.UnmarshalStrict(raw, &in)
+	if err != nil {
 		return in, err
 	}
-	if err := strictShape(raw, reflect.TypeFor[createInput](), ""); err != nil {
-		return in, err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&in); err != nil {
-		return in, err
+	if len(strict) > 0 {
+		return in, errors.Join(strict...)
 	}
 	if in.Name == "" || in.Spec == nil {
 		return in, fmt.Errorf("name and spec are required")
@@ -162,147 +161,4 @@ func (in createInput) definition() templateconfig.Definition {
 		d.WarmPool = in.Options.WarmPool
 	}
 	return d
-}
-func rejectDuplicateKeys(d *json.Decoder) error {
-	d.UseNumber()
-	var value func() error
-	value = func() error {
-		token, err := d.Token()
-		if err != nil {
-			return err
-		}
-		delim, ok := token.(json.Delim)
-		if !ok {
-			return nil
-		}
-		if delim == '{' {
-			keys := map[string]bool{}
-			for d.More() {
-				token, err := d.Token()
-				if err != nil {
-					return err
-				}
-				key, ok := token.(string)
-				if !ok {
-					return fmt.Errorf("invalid JSON object key")
-				}
-				if keys[key] {
-					return fmt.Errorf("duplicate JSON field")
-				}
-				keys[key] = true
-				if err := value(); err != nil {
-					return err
-				}
-			}
-		} else if delim == '[' {
-			for d.More() {
-				if err := value(); err != nil {
-					return err
-				}
-			}
-		} else {
-			return fmt.Errorf("unexpected JSON delimiter")
-		}
-		_, err = d.Token()
-		return err
-	}
-	if err := value(); err != nil {
-		return err
-	}
-	_, err := d.Token()
-	if err != io.EOF {
-		return fmt.Errorf("request must contain one JSON value")
-	}
-	return nil
-}
-
-// strictShape preserves exact field spelling (encoding/json otherwise accepts
-// case-insensitive names). It recursively checks native structs, but respects
-// custom scalar unmarshalers such as IntOrString and Kubernetes quantities.
-func strictShape(raw json.RawMessage, t reflect.Type, path string) error {
-	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return nil
-	}
-	for t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-	if reflect.PointerTo(t).Implements(reflect.TypeFor[json.Unmarshaler]()) {
-		return nil
-	}
-	switch t.Kind() {
-	case reflect.Struct:
-		var object map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &object); err != nil {
-			return err
-		}
-		fields := map[string]reflect.Type{}
-		var collect func(reflect.Type)
-		collect = func(st reflect.Type) {
-			for i := 0; i < st.NumField(); i++ {
-				f := st.Field(i)
-				if !f.IsExported() {
-					continue
-				}
-				tag := f.Tag.Get("json")
-				name := tag
-				for j, c := range tag {
-					if c == ',' {
-						name = tag[:j]
-						break
-					}
-				}
-				if name == "-" {
-					continue
-				}
-				if f.Anonymous && name == "" {
-					ft := f.Type
-					for ft.Kind() == reflect.Pointer {
-						ft = ft.Elem()
-					}
-					if ft.Kind() == reflect.Struct {
-						collect(ft)
-						continue
-					}
-				}
-				if name == "" {
-					name = f.Name
-				}
-				fields[name] = f.Type
-			}
-		}
-		collect(t)
-		for name, value := range object {
-			ft, ok := fields[name]
-			if !ok {
-				return fmt.Errorf("unsupported field %s%s", path, name)
-			}
-			if err := strictShape(value, ft, path+name+"."); err != nil {
-				return err
-			}
-		}
-	case reflect.Slice, reflect.Array:
-		if t.Elem().Kind() == reflect.Uint8 {
-			return nil
-		}
-		var array []json.RawMessage
-		if err := json.Unmarshal(raw, &array); err != nil {
-			return err
-		}
-		for _, value := range array {
-			if err := strictShape(value, t.Elem(), path); err != nil {
-				return err
-			}
-		}
-	case reflect.Map:
-		var object map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &object); err != nil {
-			return err
-		}
-		for _, value := range object {
-			if err := strictShape(value, t.Elem(), path); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }

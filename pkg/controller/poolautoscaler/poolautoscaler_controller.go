@@ -18,7 +18,6 @@ package poolautoscaler
 
 import (
 	"context"
-	stderrors "errors"
 	"flag"
 	"fmt"
 	"reflect"
@@ -148,14 +147,10 @@ func (r *Reconciler) SetupWithManager(mgr manager.Manager) error {
 		}); err != nil {
 		return err
 	}
-	b := ctrl.NewControllerManagedBy(mgr).
+	return ctrl.NewControllerManagedBy(mgr).
 		For(&agentsv1alpha1.PoolAutoscaler{}).
-		Watches(&agentsv1alpha1.SandboxSet{}, handler.EnqueueRequestsFromMapFunc(r.sandboxSetToPoolAutoscaler))
-	if discovery.DiscoverGVK(agentsv1alpha1.SandboxTemplateClaimControllerKind) {
-		b = b.Watches(&agentsv1alpha1.SandboxTemplate{}, handler.EnqueueRequestsFromMapFunc(r.templateToPoolAutoscaler)).
-			Watches(&agentsv1alpha1.SandboxTemplateClaim{}, handler.EnqueueRequestsFromMapFunc(r.claimToPoolAutoscaler))
-	}
-	return b.WithOptions(controller.Options{MaxConcurrentReconciles: concurrentReconciles}).Complete(r)
+		Watches(&agentsv1alpha1.SandboxSet{}, handler.EnqueueRequestsFromMapFunc(r.sandboxSetToPoolAutoscaler)).
+		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentReconciles}).Complete(r)
 }
 
 // sandboxSetToPoolAutoscaler maps a SandboxSet change to the PoolAutoscaler that targets it.
@@ -246,13 +241,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
-	managed, guardErr := r.checkManagedTarget(ctx, pa, sbs)
+	managed, guardErr := checkManagedTarget(pa, sbs)
 	if guardErr != nil {
 		r.deleteMonitor(req.NamespacedName)
 		r.scaleBlockedReported.Delete(req.NamespacedName.String())
-		if !stderrors.Is(guardErr, errInactiveManagedTarget) {
-			return ctrl.Result{}, guardErr
-		}
 		setCondition(pa, metav1.Condition{
 			Type: string(agentsv1alpha1.PoolAutoscalerConditionScalingActive), Status: metav1.ConditionFalse,
 			LastTransitionTime: metav1.Now(), ObservedGeneration: pa.Generation,
@@ -379,7 +371,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// Compare against spec (what we previously told SandboxSet), not status
 	if desiredReplicas != specReplicas {
-		if err := r.scaleTarget(ctx, pa, sbs, desiredReplicas, managed); err != nil {
+		if err := r.scaleTarget(ctx, sbs, desiredReplicas, managed); err != nil {
 			setCondition(pa, metav1.Condition{
 				Type:               string(agentsv1alpha1.PoolAutoscalerConditionAbleToScale),
 				Status:             metav1.ConditionFalse,

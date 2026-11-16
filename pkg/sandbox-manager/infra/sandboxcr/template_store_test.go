@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-	http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package sandboxcr
 
 import (
@@ -95,7 +96,7 @@ func TestTemplateStoreBoundGetAndNamespace(t *testing.T) {
 			if !errors.Is(err, test.want) {
 				t.Fatalf("error=%v want=%v", err, test.want)
 			}
-			if err == nil && (!got.DefinitionReady || got.ID != v.Name) {
+			if err == nil && (got.Phase != "Ready" || got.ID != v.Name) {
 				t.Fatalf("observation=%+v", got)
 			}
 			list, err := store.ListVersions(t.Context(), claim.Identity)
@@ -174,7 +175,7 @@ func TestTemplateStorePersistedFinalizersAndPartialFailure(t *testing.T) {
 			if err := base.Get(t.Context(), client.ObjectKey{Namespace: claim.Namespace, Name: templateTestID}, version); err != nil {
 				t.Fatal(err)
 			}
-			if len(version.Finalizers) != 1 || version.OwnerReferences[0].UID != persisted.UID || version.Spec.BuildOptions.WarmPool.Size == nil {
+			if len(version.Finalizers) != 0 || version.OwnerReferences[0].UID != persisted.UID || !ptr.Deref(version.OwnerReferences[0].BlockOwnerDeletion, false) || version.Spec.BuildOptions.WarmPool.Size == nil {
 				t.Fatalf("version=%+v", version)
 			}
 		})
@@ -228,6 +229,82 @@ func TestTemplateStoreReadErrorsNeverBecomeAbsence(t *testing.T) {
 	_, err = s.Deleted(t.Context(), infra.TemplateClaimIdentity{Namespace: "team-a", Name: "python-agent", UID: "uid"})
 	if !errors.Is(err, infra.ErrTemplateViewUnavailable) {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestTemplateVersionObservationCurrentDefinition(t *testing.T) {
+	for _, state := range []string{"ready", "empty phase", "generation stale", "condition stale", "ready disagrees", "failed", "failed wrong reason", "building"} {
+		t.Run(state, func(t *testing.T) {
+			_, v := templateTestFixture()
+			want, message := "Pending", ""
+			switch state {
+			case "ready":
+				want = "Ready"
+			case "empty phase":
+				v.Status.Phase = ""
+			case "generation stale":
+				v.Generation++
+			case "condition stale":
+				v.Status.Conditions[0].ObservedGeneration++
+			case "ready disagrees":
+				v.Status.Conditions[0].Status = metav1.ConditionFalse
+			case "failed", "failed wrong reason":
+				v.Status.Phase = api.SandboxTemplatePhaseFailed
+				v.Status.Conditions[0].Status = metav1.ConditionFalse
+				v.Status.Conditions[0].Reason = templatecreation.DefinitionInvalidReason
+				v.Status.Conditions[0].Message = "Invalid definition."
+				if state == "failed" {
+					want, message = "Failed", v.Status.Conditions[0].Message
+				} else {
+					v.Status.Conditions[0].Reason = "TransientFailure"
+				}
+			case "building":
+				v.Status.Phase = api.SandboxTemplatePhaseBuilding
+				want = "Building"
+			}
+			got := observeTemplateVersion(v)
+			if got.Phase != want || got.Message != message {
+				t.Fatalf("observation=%+v want=%s message=%q", got, want, message)
+			}
+		})
+	}
+}
+
+func TestTemplateStoreDeletionConfirmsOnlyNegativeCacheReads(t *testing.T) {
+	for _, state := range []string{"current", "cache missing", "cache old UID", "absent", "replacement"} {
+		t.Run(state, func(t *testing.T) {
+			c, _ := templateTestFixture()
+			cachedObjects, liveObjects := []client.Object{c}, []client.Object{c}
+			switch state {
+			case "cache missing":
+				cachedObjects = nil
+			case "cache old UID":
+				old := c.DeepCopy()
+				old.UID = "old-uid"
+				cachedObjects = []client.Object{old}
+			case "absent":
+				cachedObjects, liveObjects = nil, nil
+			case "replacement":
+				newClaim := c.DeepCopy()
+				newClaim.UID = "replacement"
+				cachedObjects, liveObjects = []client.Object{newClaim}, []client.Object{newClaim}
+			}
+			cached, live := templateTestClient(t, cachedObjects...), templateTestClient(t, liveObjects...)
+			reads := 0
+			reader := interceptor.NewClient(live, interceptor.Funcs{Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				reads++
+				return cl.Get(ctx, key, obj, opts...)
+			}})
+			s := &templateStore{cached: cached, live: reader}
+			done, err := s.Deleted(t.Context(), infra.TemplateClaimIdentity{Namespace: c.Namespace, Name: c.Name, UID: string(c.UID)})
+			wantReads := 1
+			if state == "current" {
+				wantReads = 0
+			}
+			if err != nil || done != (state == "absent" || state == "replacement") || reads != wantReads {
+				t.Fatalf("done=%v reads=%d err=%v", done, reads, err)
+			}
+		})
 	}
 }
 

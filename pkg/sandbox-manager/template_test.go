@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-	http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package sandbox_manager
 
 import (
@@ -61,7 +62,7 @@ func (s *templateBusinessStore) CreateVersion(_ context.Context, _ infra.Templat
 	if s.failVersion != nil {
 		return s.failVersion
 	}
-	s.versions = []infra.TemplateVersionObservation{{ID: id, Phase: "Ready", Generation: 1, ObservedGeneration: 1, DefinitionReady: true}}
+	s.versions = []infra.TemplateVersionObservation{{ID: id, Phase: "Ready"}}
 	return nil
 }
 func (s *templateBusinessStore) GetClaim(context.Context, string, string) (*infra.TemplateClaimObservation, error) {
@@ -134,7 +135,7 @@ func TestTemplateManagerCreationAndPartialFailure(t *testing.T) {
 		})
 	}
 	s := &templateBusinessStore{}
-	_, err := templateBusinessManager(s).CreateTemplate(t.Context(), "team-a", "INVALID", templateconfig.Definition{})
+	_, err := templateBusinessManager(s).CreateTemplate(t.Context(), "team-a", "python-agent", templateconfig.Definition{})
 	if managererrors.GetErrCode(err) != managererrors.ErrorBadRequest || s.createCalls != 0 {
 		t.Fatalf("validation order: %v calls=%d", err, s.createCalls)
 	}
@@ -142,8 +143,8 @@ func TestTemplateManagerCreationAndPartialFailure(t *testing.T) {
 func TestTemplateManagerLatestAndBoundSelection(t *testing.T) {
 	now := time.Now()
 	s := &templateBusinessStore{claim: &infra.TemplateClaimObservation{Identity: infra.TemplateClaimIdentity{Namespace: "team-a", Name: "python-agent", UID: "claim-uid"}}, versions: []infra.TemplateVersionObservation{
-		{ID: "a7f2k9m4p1q8r3s6t0v5", CreatedAt: now.Add(-time.Second), Phase: "Ready", Generation: 1, ObservedGeneration: 1, DefinitionReady: true},
-		{ID: "b7f2k9m4p1q8r3s6t0v5", CreatedAt: now, Phase: "Failed", Generation: 1, ObservedGeneration: 1, DefinitionFailed: true, Message: "Invalid definition."},
+		{ID: "a7f2k9m4p1q8r3s6t0v5", CreatedAt: now.Add(-time.Second), Phase: "Ready"},
+		{ID: "b7f2k9m4p1q8r3s6t0v5", CreatedAt: now, Phase: "Failed", Message: "Invalid definition."},
 	}}
 	m := templateBusinessManager(s)
 	latest, err := m.GetTemplate(t.Context(), "team-a", "python-agent", "")

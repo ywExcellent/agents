@@ -36,6 +36,6 @@ GO111MODULE=on kube::codegen::gen_client \
     --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
     "${SCRIPT_ROOT}"
 
-# API changes are additive. Copy only successful generator output, retaining
-# untracked files rather than recursively deleting client or vendor directories.
+# Replace generated directories only after generation succeeds, so removed APIs leave no stale output.
+rm -rf "${SCRIPT_ROOT}/client/clientset" "${SCRIPT_ROOT}/client/informers" "${SCRIPT_ROOT}/client/listers"
 cp -R "${TMP_DIR}/client/." "${SCRIPT_ROOT}/client/"

@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-	http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package sandboxcr
 
 import (
@@ -23,14 +24,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
-	toolscache "k8s.io/client-go/tools/cache"
 	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	api "github.com/openkruise/agents/api/v1alpha1"
+	infracache "github.com/openkruise/agents/pkg/cache"
 	"github.com/openkruise/agents/pkg/templatecreation"
 	"github.com/openkruise/agents/pkg/templateindex"
 )
@@ -42,13 +42,13 @@ type templateKeyReader interface {
 }
 
 type templateView struct {
-	cache      ctrlcache.Cache
-	healthy    atomic.Bool
-	closed     atomic.Bool
-	watchError atomic.Int64
-	mu         sync.Mutex
-	cancel     context.CancelFunc
-	done       chan struct{}
+	cache   ctrlcache.Cache
+	healthy atomic.Bool
+	closed  atomic.Bool
+	health  infracache.InformerHealth
+	mu      sync.Mutex
+	cancel  context.CancelFunc
+	done    chan struct{}
 }
 
 func NewTemplateStore(config *rest.Config, namespace string) (*templateStore, error) {
@@ -56,17 +56,10 @@ func NewTemplateStore(config *rest.Config, namespace string) (*templateStore, er
 	if err := api.AddToScheme(scheme); err != nil {
 		return nil, err
 	}
-	if err := corev1.AddToScheme(scheme); err != nil {
-		return nil, err
-	}
 	view := &templateView{}
 	opts := ctrlcache.Options{Scheme: scheme, ReaderFailOnMissingInformer: true,
-		DefaultWatchErrorHandler: func(_ context.Context, _ *toolscache.Reflector, err error) {
-			if err != nil {
-				view.watchError.Store(time.Now().UnixNano())
-			}
-		},
-		ByObject: map[client.Object]ctrlcache.ByObject{}}
+		DefaultWatchErrorHandler: view.health.RecordWatchError,
+		ByObject:                 map[client.Object]ctrlcache.ByObject{}}
 	if namespace != "" {
 		opts.DefaultNamespaces = map[string]ctrlcache.Config{namespace: {}}
 	}
@@ -125,6 +118,7 @@ func (v *templateView) Run(ctx context.Context) error {
 		cancel()
 		return fmt.Errorf("template control cache initial synchronization failed")
 	}
+	v.health.MarkSynced()
 	v.healthy.Store(true)
 	select {
 	case err := <-stopped:
@@ -154,11 +148,7 @@ func (v *templateView) Stop(ctx context.Context) {
 	}
 }
 func (v *templateView) Healthy() bool {
-	if v.closed.Load() || !v.healthy.Load() {
-		return false
-	}
-	last := v.watchError.Load()
-	return last == 0 || time.Since(time.Unix(0, last)) >= 2*time.Minute
+	return !v.closed.Load() && v.healthy.Load() && v.health.Healthy()
 }
 
 // compile-time assertion: all live access is Get-only.

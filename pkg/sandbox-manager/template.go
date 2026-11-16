@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-	http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package sandbox_manager
 
 import (
@@ -23,12 +24,9 @@ import (
 	"sort"
 	"time"
 
-	"k8s.io/apimachinery/pkg/util/validation/field"
-
 	managererrors "github.com/openkruise/agents/pkg/sandbox-manager/errors"
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra"
 	"github.com/openkruise/agents/pkg/templateconfig"
-	"github.com/openkruise/agents/pkg/templatevalidation"
 )
 
 // TemplateSummary is a business observation, not an HTTP response model.
@@ -74,9 +72,6 @@ func allocateTemplateID() (string, error) {
 	return string(out), nil
 }
 func (m *SandboxManager) CreateTemplate(ctx context.Context, ns, name string, d templateconfig.Definition) (TemplateSummary, error) {
-	if ns == "" || len(templatevalidation.ValidateName(name, field.NewPath("name"))) > 0 {
-		return TemplateSummary{}, managererrors.NewError(managererrors.ErrorBadRequest, "Invalid template name.")
-	}
 	normalized, err := templateconfig.NormalizeDefinition(d)
 	if err != nil {
 		return TemplateSummary{}, managererrors.WrapError(managererrors.ErrorBadRequest, err, "Invalid template definition.")
@@ -102,25 +97,10 @@ func (m *SandboxManager) CreateTemplate(ctx context.Context, ns, name string, d 
 func templateSummary(c infra.TemplateClaimObservation, v *infra.TemplateVersionObservation) TemplateSummary {
 	s := TemplateSummary{Name: c.Identity.Name, Status: "Unknown"}
 	if v != nil {
-		s.ID = v.ID
-		s.Status = "Pending"
-		switch v.Phase {
-		case "Building":
-			s.Status = "Building"
-		case "Ready":
-			if v.Generation == v.ObservedGeneration && v.DefinitionReady {
-				s.Status = "Ready"
-			}
-		case "Failed":
-			if v.Generation == v.ObservedGeneration && v.DefinitionFailed {
-				s.Status = "Failed"
-				s.Message = v.Message
-			}
-		}
+		s.ID, s.Status, s.Message = v.ID, v.Phase, v.Message
 	}
 	if c.Deleting || v != nil && v.Deleting {
-		s.Status = "Deleting"
-		s.Message = ""
+		s.Status, s.Message = "Deleting", ""
 	}
 	return s
 }
@@ -137,9 +117,6 @@ func latestTemplateVersion(v []infra.TemplateVersionObservation) *infra.Template
 	return &v[0]
 }
 func (m *SandboxManager) GetTemplate(ctx context.Context, ns, name, id string) (TemplateSummary, error) {
-	if len(templatevalidation.ValidateName(name, field.NewPath("name"))) > 0 || id != "" && len(templatevalidation.ValidateID(id, field.NewPath("templateId"))) > 0 {
-		return TemplateSummary{}, managererrors.NewError(managererrors.ErrorBadRequest, "Invalid template name or ID.")
-	}
 	store, err := m.templateBackend()
 	if err != nil {
 		return TemplateSummary{}, err
@@ -182,9 +159,6 @@ func (m *SandboxManager) ListTemplates(ctx context.Context, ns string) ([]Templa
 	return out, nil
 }
 func (m *SandboxManager) DeleteTemplate(ctx context.Context, ns, name string) error {
-	if len(templatevalidation.ValidateName(name, field.NewPath("name"))) > 0 {
-		return managererrors.NewError(managererrors.ErrorBadRequest, "Invalid template name.")
-	}
 	store, err := m.templateBackend()
 	if err != nil {
 		return err

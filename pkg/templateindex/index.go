@@ -29,10 +29,8 @@ import (
 )
 
 const (
-	OwnerUID     = "ownerRefUID"
-	ClaimOwner   = "templateClaimOwnerUID"
-	VersionOwner = "templateVersionOwnerUID"
-	TemplateRef  = "sandboxSetTemplateRef"
+	ClaimOwner  = "templateClaimOwnerUID"
+	TemplateRef = "sandboxSetTemplateRef"
 )
 
 // ClaimOwnerReference identifies a version carrying an actual Claim controller
@@ -64,18 +62,6 @@ func VersionOwnerReference(obj metav1.Object) *metav1.OwnerReference {
 	return owner
 }
 
-// ControllerOwnerUID preserves the generic controller-owner index vocabulary.
-func ControllerOwnerUID(obj client.Object) []string {
-	if obj == nil {
-		return nil
-	}
-	owner := metav1.GetControllerOfNoCopy(obj)
-	if owner == nil {
-		return nil
-	}
-	return []string{string(owner.UID)}
-}
-
 // ClaimOwnerUID indexes only concrete versions owned by Claims in this API.
 func ClaimOwnerUID(obj client.Object) []string {
 	template, ok := obj.(*api.SandboxTemplate)
@@ -83,16 +69,6 @@ func ClaimOwnerUID(obj client.Object) []string {
 		return nil
 	}
 	owner := ClaimOwnerReference(template)
-	if owner == nil {
-		return nil
-	}
-	return []string{string(owner.UID)}
-}
-
-// VersionOwnerUID indexes managed-resource candidates. Consumers must confirm
-// the referenced version and its Claim owner before treating them as companions.
-func VersionOwnerUID(obj client.Object) []string {
-	owner := VersionOwnerReference(obj)
 	if owner == nil {
 		return nil
 	}

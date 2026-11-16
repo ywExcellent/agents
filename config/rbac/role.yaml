@@ -67,6 +67,7 @@ rules:
   - agents.kruise.io
   resources:
   - checkpoints
+  - sandboxtemplates
   verbs:
   - create
   - delete
@@ -80,8 +81,6 @@ rules:
   - poolautoscalers
   - sandboxes
   - sandboxsets
-  - sandboxtemplateclaims
-  - sandboxtemplates
   - sandboxupdateops
   verbs:
   - create
@@ -121,6 +120,15 @@ rules:
   - sandboxclaims
   verbs:
   - delete
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - agents.kruise.io
+  resources:
+  - sandboxtemplateclaims
+  verbs:
   - get
   - list
   - patch

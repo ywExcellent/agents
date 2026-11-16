@@ -43,11 +43,10 @@ func TestIndexExtractors(t *testing.T) {
 	}{
 		{"Claim owner", ClaimOwnerUID, version, []string{"claim-uid"}},
 		{"foreign Claim group", ClaimOwnerUID, foreign, nil},
-		{"version owner", VersionOwnerUID, pool, []string{"version-uid"}},
 		{"unlabeled external reference", TemplateRefName, pool, []string{version.Name}},
 		{"wrong reference object", TemplateRefName, version, nil},
 		{"empty reference", TemplateRefName, &api.SandboxSet{}, nil},
-		{"no owner", ControllerOwnerUID, &api.SandboxSet{}, nil},
+		{"no owner", ClaimOwnerUID, &api.SandboxTemplate{}, nil},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
